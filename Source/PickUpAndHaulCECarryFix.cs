@@ -956,7 +956,7 @@ namespace PickUpAndHaulCECarryFix
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var candidate = candidates[i];
-                    if (WorkGiver_HaulToInventory.skipCells.Contains(candidate.Cell))
+                    if (WorkGiver_HaulToInventory.skipCells != null && WorkGiver_HaulToInventory.skipCells.Contains(candidate.Cell))
                     {
                         continue;
                     }
@@ -970,7 +970,7 @@ namespace PickUpAndHaulCECarryFix
                     if (StoreUtility.IsGoodStoreCell(candidate.Cell, map, thing, carrier, faction) && candidate.Cell != default)
                     {
                         foundCell = candidate.Cell;
-                        WorkGiver_HaulToInventory.skipCells.Add(candidate.Cell);
+                        WorkGiver_HaulToInventory.skipCells?.Add(candidate.Cell);
                         return true;
                     }
                 }

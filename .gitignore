@@ -1,0 +1,5 @@
+Source/obj/
+.vs/
+*.user
+*.suo
+bin/

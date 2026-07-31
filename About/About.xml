@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<ModMetaData>
+  <name>Pick Up And Haul CE Carry Fix</name>
+  <author>local</author>
+  <packageId>local.pickupandhaul.cecarryfix</packageId>
+  <supportedVersions>
+    <li>1.6</li>
+  </supportedVersions>
+  <modDependencies>
+    <li>
+      <packageId>brrainz.harmony</packageId>
+      <displayName>Harmony</displayName>
+      <steamWorkshopUrl>steam://url/CommunityFilePage/2009463077</steamWorkshopUrl>
+    </li>
+    <li>
+      <packageId>Mehni.PickUpAndHaul</packageId>
+      <displayName>Pick Up And Haul</displayName>
+      <steamWorkshopUrl>steam://url/CommunityFilePage/1279012058</steamWorkshopUrl>
+    </li>
+    <li>
+      <packageId>CETeam.CombatExtended</packageId>
+      <displayName>Combat Extended</displayName>
+      <steamWorkshopUrl>steam://url/CommunityFilePage/2890901044</steamWorkshopUrl>
+    </li>
+  </modDependencies>
+  <loadAfter>
+    <li>brrainz.harmony</li>
+    <li>Mehni.PickUpAndHaul</li>
+    <li>CETeam.CombatExtended</li>
+  </loadAfter>
+  <description>Makes Pick Up And Haul use Combat Extended inventory capacity instead of vanilla mass encumbrance for opportunistic hauling.</description>
+</ModMetaData>

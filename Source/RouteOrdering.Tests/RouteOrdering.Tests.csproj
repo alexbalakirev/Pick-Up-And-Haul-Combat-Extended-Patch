@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('..\RouteOrdering.cs')">
+    <DefineConstants>$(DefineConstants);HAS_ROUTE_ORDERING</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('..\HarmonyTargetDiscovery.cs')">
+    <DefineConstants>$(DefineConstants);HAS_HARMONY_TARGET_DISCOVERY</DefineConstants>
+  </PropertyGroup>
+
+  <ItemGroup Condition="Exists('..\RouteOrdering.cs')">
+    <Compile Include="..\RouteOrdering.cs" Link="RouteOrdering.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\HarmonyTargetDiscovery.cs')">
+    <Compile Include="..\HarmonyTargetDiscovery.cs" Link="HarmonyTargetDiscovery.cs" />
+  </ItemGroup>
+
+</Project>

@@ -754,7 +754,7 @@ namespace PickUpAndHaulCECarryFix
                 {
                     var storeTarget = allocation.Key;
                     var accepts = storeTarget.container?.TryGetInnerInteractableThingOwner().CanAcceptAnyOf(nextThing)
-                        ?? storeTarget.cell.GetSlotGroup(map).parent.Accepts(nextThing);
+                        ?? storeTarget.cell.GetSlotGroup(map)?.parent?.Accepts(nextThing) == true;
                     if (accepts && WorkGiver_HaulToInventory.Stackable(nextThing, allocation))
                     {
                         storeCell = storeTarget;

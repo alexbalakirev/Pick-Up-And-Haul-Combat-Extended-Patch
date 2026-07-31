@@ -2050,6 +2050,8 @@ namespace PickUpAndHaulCECarryFix
     [HarmonyPatch]
     public static class Patch_JobDriver_CheckForOverencumberedForCombatExtended
     {
+        public static bool Prepare() => TargetMethod() != null;
+
         public static MethodBase TargetMethod()
         {
             foreach (var nestedType in typeof(JobDriver_HaulToInventory).GetNestedTypes(BindingFlags.NonPublic))

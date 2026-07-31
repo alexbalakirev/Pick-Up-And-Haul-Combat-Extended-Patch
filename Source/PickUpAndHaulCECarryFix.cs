@@ -1003,7 +1003,7 @@ namespace PickUpAndHaulCECarryFix
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var destinationThing = candidates[i];
-                    if (destinationThing == null || destinationThing.Destroyed || destinationThing.Faction != faction || WorkGiver_HaulToInventory.skipThings.Contains(destinationThing))
+                    if (destinationThing == null || destinationThing.Destroyed || destinationThing.Faction != faction || (WorkGiver_HaulToInventory.skipThings != null && WorkGiver_HaulToInventory.skipThings.Contains(destinationThing)))
                     {
                         continue;
                     }

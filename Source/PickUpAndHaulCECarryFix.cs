@@ -1054,7 +1054,7 @@ namespace PickUpAndHaulCECarryFix
 
                 if (haulDestination is Thing foundThing)
                 {
-                    WorkGiver_HaulToInventory.skipThings.Add(foundThing);
+                    WorkGiver_HaulToInventory.skipThings?.Add(foundThing);
                 }
 
                 return haulDestination != null;

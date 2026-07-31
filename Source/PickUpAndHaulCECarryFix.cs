@@ -933,8 +933,8 @@ namespace PickUpAndHaulCECarryFix
                 }
 
                 foundCell = foundCell2;
-                haulDestination = foundCell2.GetSlotGroup(map).parent;
-                return true;
+                haulDestination = foundCell2.GetSlotGroup(map)?.parent;
+                return haulDestination != null;
             }
 
             private bool TryFindBestBetterStoreCellFor(

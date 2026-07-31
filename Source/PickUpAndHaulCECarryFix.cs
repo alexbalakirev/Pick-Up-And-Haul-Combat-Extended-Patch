@@ -1658,6 +1658,8 @@ namespace PickUpAndHaulCECarryFix
     [HarmonyPatch]
     public static class Patch_CompatHelper_UpdateInventory
     {
+        public static bool Prepare() => TargetMethod() != null;
+
         public static MethodBase TargetMethod()
             => AccessTools.Method(AccessTools.TypeByName("PickUpAndHaul.CompatHelper"), "UpdateInventory");
 

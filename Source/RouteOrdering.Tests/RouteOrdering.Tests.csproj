@@ -16,12 +16,20 @@
     <DefineConstants>$(DefineConstants);HAS_HARMONY_TARGET_DISCOVERY</DefineConstants>
   </PropertyGroup>
 
+  <PropertyGroup Condition="Exists('..\AdaptiveStorageReservationPolicy.cs')">
+    <DefineConstants>$(DefineConstants);HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup Condition="Exists('..\RouteOrdering.cs')">
     <Compile Include="..\RouteOrdering.cs" Link="RouteOrdering.cs" />
   </ItemGroup>
 
   <ItemGroup Condition="Exists('..\HarmonyTargetDiscovery.cs')">
     <Compile Include="..\HarmonyTargetDiscovery.cs" Link="HarmonyTargetDiscovery.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\AdaptiveStorageReservationPolicy.cs')">
+    <Compile Include="..\AdaptiveStorageReservationPolicy.cs" Link="AdaptiveStorageReservationPolicy.cs" />
   </ItemGroup>
 
 </Project>

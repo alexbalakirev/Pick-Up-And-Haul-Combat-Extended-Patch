@@ -1806,12 +1806,10 @@ namespace PickUpAndHaulCECarryFix
             }
 
             pawn.ReserveAsManyAsPossible(job.targetQueueA, job);
-            if (!job.targetQueueB.NullOrEmpty())
-            {
-                pawn.ReserveAsManyAsPossible(job.targetQueueB, job);
-            }
+            AdaptiveStorageReservationCompatibility.ReserveAdditionalGatherDestinations(pawn, job);
 
-            __result = pawn.Reserve(job.targetQueueA[0], job) && pawn.Reserve(job.targetB, job);
+            __result = pawn.Reserve(job.targetQueueA[0], job)
+                && AdaptiveStorageReservationCompatibility.ReservePrimaryGatherDestination(pawn, job);
             return false;
         }
     }

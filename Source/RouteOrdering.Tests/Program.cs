@@ -31,6 +31,13 @@ internal static class Program
         Fail("Harmony target-discovery production helper is missing");
 #endif
 
+#if HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY
+        Run("Adaptive Storage uses just-in-time destination reservations", AdaptiveStorageUsesJustInTimeReservations);
+        Run("only reservation-blocked Adaptive Storage unloads retry", OnlyReservationBlockedAdaptiveStorageRetries);
+#else
+        Fail("Adaptive Storage reservation-policy production helper is missing");
+#endif
+
         Console.WriteLine(failures == 0
             ? "All regression tests passed."
             : $"{failures} regression test(s) failed.");
@@ -178,6 +185,45 @@ internal static class Program
     }
 #endif
 
+
+#if HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY
+    private static void AdaptiveStorageUsesJustInTimeReservations()
+    {
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldReserveDuringGather(typeof(AdaptiveStorage.ThingClass)));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldReserveDuringGather(typeof(DerivedAdaptiveStorage)));
+        AssertTrue(AdaptiveStorageReservationPolicy.ShouldReserveDuringGather(typeof(NormalStorage)));
+        AssertTrue(AdaptiveStorageReservationPolicy.ShouldReserveDuringGather(null));
+    }
+
+    private static void OnlyReservationBlockedAdaptiveStorageRetries()
+    {
+        AssertTrue(AdaptiveStorageReservationPolicy.ShouldRetryUnload(
+            isAdaptiveStorage: true,
+            otherwiseEligible: true,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldRetryUnload(
+            isAdaptiveStorage: true,
+            otherwiseEligible: false,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldRetryUnload(
+            isAdaptiveStorage: true,
+            otherwiseEligible: true,
+            canReserveNow: true));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldRetryUnload(
+            isAdaptiveStorage: false,
+            otherwiseEligible: true,
+            canReserveNow: false));
+    }
+
+    private class NormalStorage
+    {
+    }
+
+    private sealed class DerivedAdaptiveStorage : AdaptiveStorage.ThingClass
+    {
+    }
+#endif
+
     private static void AssertSequence(IReadOnlyList<int> expected, IReadOnlyList<int> actual)
     {
         AssertEqual(expected.Count, actual.Count);
@@ -228,3 +274,12 @@ internal static class Program
     }
 #endif
 }
+
+#if HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY
+namespace AdaptiveStorage
+{
+    internal class ThingClass
+    {
+    }
+}
+#endif

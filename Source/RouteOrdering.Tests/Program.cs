@@ -34,6 +34,7 @@ internal static class Program
 #if HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY
         Run("Adaptive Storage uses just-in-time destination reservations", AdaptiveStorageUsesJustInTimeReservations);
         Run("only reservation-blocked Adaptive Storage unloads retry", OnlyReservationBlockedAdaptiveStorageRetries);
+        Run("only reservation-blocked Adaptive Storage planning uses fallback", OnlyReservationBlockedAdaptiveStoragePlanningUsesFallback);
 #else
         Fail("Adaptive Storage reservation-policy production helper is missing");
 #endif
@@ -213,6 +214,35 @@ internal static class Program
             isAdaptiveStorage: false,
             otherwiseEligible: true,
             canReserveNow: false));
+    }
+
+    private static void OnlyReservationBlockedAdaptiveStoragePlanningUsesFallback()
+    {
+        AssertTrue(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+            isAdaptiveStorage: true,
+            priorityEligible: true,
+            otherwiseEligible: true,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+            isAdaptiveStorage: false,
+            priorityEligible: true,
+            otherwiseEligible: true,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+            isAdaptiveStorage: true,
+            priorityEligible: false,
+            otherwiseEligible: true,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+            isAdaptiveStorage: true,
+            priorityEligible: true,
+            otherwiseEligible: false,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+            isAdaptiveStorage: true,
+            priorityEligible: true,
+            otherwiseEligible: true,
+            canReserveNow: true));
     }
 
     private class NormalStorage

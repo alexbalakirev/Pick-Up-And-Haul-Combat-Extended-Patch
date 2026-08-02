@@ -130,7 +130,30 @@ namespace PickUpAndHaulCECarryFix
             var currentPriority = StoreUtility.CurrentStoragePriorityOf(thing);
             ThingOwner nonSlotGroupThingOwner = null;
             WorkGiver_HaulToInventory.StoreTarget storeTarget;
-            if (StoreUtility.TryFindBestBetterStorageFor(thing, pawn, map, currentPriority, pawn.Faction, out var targetCell, out var haulDestination, true))
+            IntVec3 targetCell;
+            IHaulDestination haulDestination;
+            var foundStorage = StoreUtility.TryFindBestBetterStorageFor(
+                thing,
+                pawn,
+                map,
+                currentPriority,
+                pawn.Faction,
+                out targetCell,
+                out haulDestination,
+                true);
+            if (!foundStorage)
+            {
+                foundStorage = AdaptiveStorageReservationCompatibility.TryFindPlanningFallback(
+                    thing,
+                    pawn,
+                    currentPriority,
+                    acceptSamePriority: true,
+                    logSelection: true,
+                    out targetCell,
+                    out haulDestination);
+            }
+
+            if (foundStorage)
             {
                 if (haulDestination is ISlotGroupParent)
                 {
@@ -1858,6 +1881,33 @@ namespace PickUpAndHaulCECarryFix
                     yield return instruction;
                 }
             }
+        }
+    }
+
+    [HarmonyPatch(typeof(WorkGiver_HaulToInventory), nameof(WorkGiver_HaulToInventory.HasJobOnThing))]
+    public static class Patch_WorkGiver_HasJobOnThing_AdaptiveStorageReservation
+    {
+        public static void Postfix(Pawn pawn, Thing thing, bool forced, ref bool __result)
+        {
+            if (__result
+                || !PickUpAndHaulPerformance.Enabled
+                || pawn?.Map == null
+                || thing == null
+                || !WorkGiver_HaulToInventory.OkThingToHaul(thing, pawn)
+                || !WorkGiver_HaulToInventory.IsNotCorpseOrAllowed(thing)
+                || !HaulAIUtility.PawnCanAutomaticallyHaulFast(pawn, thing, forced))
+            {
+                return;
+            }
+
+            __result = AdaptiveStorageReservationCompatibility.TryFindPlanningFallback(
+                thing,
+                pawn,
+                StoreUtility.CurrentStoragePriorityOf(thing),
+                acceptSamePriority: false,
+                logSelection: false,
+                out _,
+                out _);
         }
     }
 

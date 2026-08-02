@@ -59,6 +59,83 @@ namespace PickUpAndHaulCECarryFix
             return !ShouldReserveDuringGather(job.targetB, pawn.Map) || pawn.Reserve(job.targetB, job);
         }
 
+        internal static bool TryFindPlanningFallback(
+            Thing thing,
+            Pawn pawn,
+            StoragePriority currentPriority,
+            bool acceptSamePriority,
+            bool logSelection,
+            out IntVec3 foundCell,
+            out IHaulDestination haulDestination)
+        {
+            foundCell = IntVec3.Invalid;
+            haulDestination = null;
+
+            var map = pawn?.Map;
+            if (thing == null || map == null || !ModsConfig.IsActive("adaptive.storage.framework"))
+            {
+                return false;
+            }
+
+            var origin = thing.SpawnedOrAnyParentSpawned ? thing.PositionHeld : pawn.PositionHeld;
+            var slotGroups = map.haulDestinationManager.AllGroupsListInPriorityOrder;
+            for (var i = 0; i < slotGroups.Count; i++)
+            {
+                var slotGroup = slotGroups[i];
+                var priority = slotGroup.Settings.Priority;
+                var priorityEligible = acceptSamePriority
+                    ? (int)priority >= (int)currentPriority
+                    : (int)priority > (int)currentPriority;
+                var isAdaptiveStorage = AdaptiveStorageReservationPolicy.IsAdaptiveStorageType(
+                    slotGroup.parent?.GetType());
+
+                if (!priorityEligible || !isAdaptiveStorage || !slotGroup.parent.Accepts(thing))
+                {
+                    continue;
+                }
+
+                var cells = slotGroup.CellsList;
+                for (var j = 0; j < cells.Count; j++)
+                {
+                    var cell = cells[j];
+                    if (cell == default)
+                    {
+                        continue;
+                    }
+
+                    var otherwiseEligible = !cell.IsForbidden(pawn)
+                        && StoreUtility.IsGoodStoreCell(cell, map, thing, null, null)
+                        && map.reachability.CanReach(
+                            origin,
+                            cell,
+                            PathEndMode.ClosestTouch,
+                            TraverseParms.For(pawn, Danger.Deadly));
+                    var canReserveNow = pawn.CanReserveNew(cell);
+
+                    if (!AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+                        isAdaptiveStorage,
+                        priorityEligible,
+                        otherwiseEligible,
+                        canReserveNow))
+                    {
+                        continue;
+                    }
+
+                    foundCell = cell;
+                    haulDestination = slotGroup.parent;
+                    if (logSelection && PickUpAndHaulDiagnostics.Enabled)
+                    {
+                        Log.Message(
+                            $"[Pick Up And Haul CE Carry Fix] {pawn} planning {thing} through temporary Adaptive Storage reservation at {cell}.");
+                    }
+
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         public static Toil MakeFindTargetOrWait(
             JobDriver_UnloadYourHauledInventory driver,
             HashSet<Thing> carriedThings)

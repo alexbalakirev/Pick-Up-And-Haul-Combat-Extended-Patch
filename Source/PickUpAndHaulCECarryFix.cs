@@ -147,7 +147,6 @@ namespace PickUpAndHaulCECarryFix
                     thing,
                     pawn,
                     currentPriority,
-                    acceptSamePriority: true,
                     logSelection: true,
                     out targetCell,
                     out haulDestination);
@@ -1904,7 +1903,6 @@ namespace PickUpAndHaulCECarryFix
                 thing,
                 pawn,
                 StoreUtility.CurrentStoragePriorityOf(thing),
-                acceptSamePriority: false,
                 logSelection: false,
                 out _,
                 out _);

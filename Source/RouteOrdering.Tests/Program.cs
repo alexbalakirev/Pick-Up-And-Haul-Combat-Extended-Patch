@@ -34,6 +34,7 @@ internal static class Program
 #if HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY
         Run("Adaptive Storage uses just-in-time destination reservations", AdaptiveStorageUsesJustInTimeReservations);
         Run("only reservation-blocked Adaptive Storage unloads retry", OnlyReservationBlockedAdaptiveStorageRetries);
+        Run("reserved planned unload target only wins over worse alternatives", ReservedPlannedUnloadTargetOnlyWinsOverWorseAlternatives);
         Run("only reservation-blocked Adaptive Storage planning uses fallback", OnlyReservationBlockedAdaptiveStoragePlanningUsesFallback);
 #else
         Fail("Adaptive Storage reservation-policy production helper is missing");
@@ -216,31 +217,81 @@ internal static class Program
             canReserveNow: false));
     }
 
+    private static void ReservedPlannedUnloadTargetOnlyWinsOverWorseAlternatives()
+    {
+        AssertTrue(AdaptiveStorageReservationPolicy.ShouldHoldPlannedUnloadTarget(
+            isAdaptiveStorage: true,
+            otherwiseEligible: true,
+            canReserveNow: false,
+            hasNormalDestination: false,
+            plannedPriority: 3,
+            normalPriority: 0));
+        AssertTrue(AdaptiveStorageReservationPolicy.ShouldHoldPlannedUnloadTarget(
+            isAdaptiveStorage: true,
+            otherwiseEligible: true,
+            canReserveNow: false,
+            hasNormalDestination: true,
+            plannedPriority: 3,
+            normalPriority: 2));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldHoldPlannedUnloadTarget(
+            isAdaptiveStorage: true,
+            otherwiseEligible: true,
+            canReserveNow: false,
+            hasNormalDestination: true,
+            plannedPriority: 3,
+            normalPriority: 3));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldHoldPlannedUnloadTarget(
+            isAdaptiveStorage: true,
+            otherwiseEligible: true,
+            canReserveNow: false,
+            hasNormalDestination: true,
+            plannedPriority: 3,
+            normalPriority: 4));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldHoldPlannedUnloadTarget(
+            isAdaptiveStorage: false,
+            otherwiseEligible: true,
+            canReserveNow: false,
+            hasNormalDestination: false,
+            plannedPriority: 3,
+            normalPriority: 0));
+    }
+
     private static void OnlyReservationBlockedAdaptiveStoragePlanningUsesFallback()
     {
         AssertTrue(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
             isAdaptiveStorage: true,
-            priorityEligible: true,
+            candidatePriority: 4,
+            currentPriority: 3,
+            otherwiseEligible: true,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+            isAdaptiveStorage: true,
+            candidatePriority: 3,
+            currentPriority: 3,
+            otherwiseEligible: true,
+            canReserveNow: false));
+        AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
+            isAdaptiveStorage: true,
+            candidatePriority: 2,
+            currentPriority: 3,
             otherwiseEligible: true,
             canReserveNow: false));
         AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
             isAdaptiveStorage: false,
-            priorityEligible: true,
+            candidatePriority: 4,
+            currentPriority: 3,
             otherwiseEligible: true,
             canReserveNow: false));
         AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
             isAdaptiveStorage: true,
-            priorityEligible: false,
-            otherwiseEligible: true,
-            canReserveNow: false));
-        AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
-            isAdaptiveStorage: true,
-            priorityEligible: true,
+            candidatePriority: 4,
+            currentPriority: 3,
             otherwiseEligible: false,
             canReserveNow: false));
         AssertFalse(AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
             isAdaptiveStorage: true,
-            priorityEligible: true,
+            candidatePriority: 4,
+            currentPriority: 3,
             otherwiseEligible: true,
             canReserveNow: true));
     }

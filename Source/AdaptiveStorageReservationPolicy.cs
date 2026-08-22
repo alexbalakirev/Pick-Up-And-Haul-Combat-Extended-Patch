@@ -12,12 +12,26 @@ namespace PickUpAndHaulCECarryFix
         public static bool ShouldRetryUnload(bool isAdaptiveStorage, bool otherwiseEligible, bool canReserveNow)
             => isAdaptiveStorage && otherwiseEligible && !canReserveNow;
 
+        public static bool ShouldHoldPlannedUnloadTarget(
+            bool isAdaptiveStorage,
+            bool otherwiseEligible,
+            bool canReserveNow,
+            bool hasNormalDestination,
+            int plannedPriority,
+            int normalPriority)
+            => ShouldRetryUnload(isAdaptiveStorage, otherwiseEligible, canReserveNow)
+                && (!hasNormalDestination || plannedPriority > normalPriority);
+
         public static bool ShouldUsePlanningFallback(
             bool isAdaptiveStorage,
-            bool priorityEligible,
+            int candidatePriority,
+            int currentPriority,
             bool otherwiseEligible,
             bool canReserveNow)
-            => isAdaptiveStorage && priorityEligible && otherwiseEligible && !canReserveNow;
+            => isAdaptiveStorage
+                && candidatePriority > currentPriority
+                && otherwiseEligible
+                && !canReserveNow;
 
         public static bool IsAdaptiveStorageType(Type type)
         {

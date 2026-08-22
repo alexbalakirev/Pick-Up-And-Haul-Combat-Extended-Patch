@@ -63,7 +63,6 @@ namespace PickUpAndHaulCECarryFix
             Thing thing,
             Pawn pawn,
             StoragePriority currentPriority,
-            bool acceptSamePriority,
             bool logSelection,
             out IntVec3 foundCell,
             out IHaulDestination haulDestination)
@@ -82,14 +81,14 @@ namespace PickUpAndHaulCECarryFix
             for (var i = 0; i < slotGroups.Count; i++)
             {
                 var slotGroup = slotGroups[i];
-                var priority = slotGroup.Settings.Priority;
-                var priorityEligible = acceptSamePriority
-                    ? (int)priority >= (int)currentPriority
-                    : (int)priority > (int)currentPriority;
+                var candidatePriority = (int)slotGroup.Settings.Priority;
+                var currentPriorityValue = (int)currentPriority;
                 var isAdaptiveStorage = AdaptiveStorageReservationPolicy.IsAdaptiveStorageType(
                     slotGroup.parent?.GetType());
 
-                if (!priorityEligible || !isAdaptiveStorage || !slotGroup.parent.Accepts(thing))
+                if (candidatePriority <= currentPriorityValue
+                    || !isAdaptiveStorage
+                    || !slotGroup.parent.Accepts(thing))
                 {
                     continue;
                 }
@@ -114,7 +113,8 @@ namespace PickUpAndHaulCECarryFix
 
                     if (!AdaptiveStorageReservationPolicy.ShouldUsePlanningFallback(
                         isAdaptiveStorage,
-                        priorityEligible,
+                        candidatePriority,
+                        currentPriorityValue,
                         otherwiseEligible,
                         canReserveNow))
                     {
@@ -174,14 +174,27 @@ namespace PickUpAndHaulCECarryFix
                 }
 
                 var thing = unloadableThing.Thing;
-                if (StoreUtility.TryFindBestBetterStorageFor(
+                var foundNormalStorage = StoreUtility.TryFindBestBetterStorageFor(
                     thing,
                     pawn,
                     pawn.Map,
                     StoragePriority.Unstored,
                     pawn.Faction,
                     out var cell,
-                    out var destination))
+                    out var destination);
+                var normalPriority = foundNormalStorage
+                    ? StoragePriorityOf(cell, destination, pawn.Map)
+                    : StoragePriority.Unstored;
+
+                // Wait only when using the normal fallback would create an immediate lower-priority re-haul loop.
+                if (ShouldHoldPlannedUnloadTarget(pawn, thing, plannedTarget, foundNormalStorage, normalPriority))
+                {
+                    job.SetTarget(TargetIndex.B, plannedTarget);
+                    WaitAndRetry(pawn, plannedTarget, thing);
+                    return;
+                }
+
+                if (foundNormalStorage)
                 {
                     job.SetTarget(TargetIndex.A, thing);
                     job.SetTarget(TargetIndex.B, cell == IntVec3.Invalid ? (LocalTargetInfo)(destination as Thing) : cell);
@@ -200,13 +213,6 @@ namespace PickUpAndHaulCECarryFix
                     }
 
                     DropAndEnd(pawn, thing, JobCondition.Incompletable);
-                    return;
-                }
-
-                if (ShouldWaitForReservation(pawn, thing, plannedTarget))
-                {
-                    job.SetTarget(TargetIndex.B, plannedTarget);
-                    WaitAndRetry(pawn, plannedTarget, thing);
                     return;
                 }
 
@@ -255,6 +261,65 @@ namespace PickUpAndHaulCECarryFix
 
         private static bool ShouldWaitForReservation(Pawn pawn, Thing thing, LocalTargetInfo target)
         {
+            if (!TryGetReservationState(
+                pawn,
+                thing,
+                target,
+                out var isAdaptiveStorage,
+                out var otherwiseEligible,
+                out var canReserveNow,
+                out _))
+            {
+                return false;
+            }
+
+            return AdaptiveStorageReservationPolicy.ShouldRetryUnload(
+                isAdaptiveStorage,
+                otherwiseEligible,
+                canReserveNow);
+        }
+
+        private static bool ShouldHoldPlannedUnloadTarget(
+            Pawn pawn,
+            Thing thing,
+            LocalTargetInfo target,
+            bool hasNormalDestination,
+            StoragePriority normalPriority)
+        {
+            if (!TryGetReservationState(
+                pawn,
+                thing,
+                target,
+                out var isAdaptiveStorage,
+                out var otherwiseEligible,
+                out var canReserveNow,
+                out var plannedPriority))
+            {
+                return false;
+            }
+
+            return AdaptiveStorageReservationPolicy.ShouldHoldPlannedUnloadTarget(
+                isAdaptiveStorage,
+                otherwiseEligible,
+                canReserveNow,
+                hasNormalDestination,
+                (int)plannedPriority,
+                (int)normalPriority);
+        }
+
+        private static bool TryGetReservationState(
+            Pawn pawn,
+            Thing thing,
+            LocalTargetInfo target,
+            out bool isAdaptiveStorage,
+            out bool otherwiseEligible,
+            out bool canReserveNow,
+            out StoragePriority priority)
+        {
+            isAdaptiveStorage = false;
+            otherwiseEligible = false;
+            canReserveNow = false;
+            priority = StoragePriority.Unstored;
             if (pawn?.Map == null || thing == null || !target.IsValid || target.HasThing)
             {
                 return false;
@@ -262,8 +327,9 @@ namespace PickUpAndHaulCECarryFix
 
             var cell = target.Cell;
             var slotGroup = cell.GetSlotGroup(pawn.Map);
-            var isAdaptiveStorage = AdaptiveStorageReservationPolicy.IsAdaptiveStorageType(slotGroup?.parent?.GetType());
-            var otherwiseEligible = isAdaptiveStorage
+            isAdaptiveStorage = AdaptiveStorageReservationPolicy.IsAdaptiveStorageType(slotGroup?.parent?.GetType());
+            priority = slotGroup?.Settings.Priority ?? StoragePriority.Unstored;
+            otherwiseEligible = isAdaptiveStorage
                 && slotGroup.parent.Accepts(thing)
                 && !cell.IsForbidden(pawn)
                 && StoreUtility.IsGoodStoreCell(cell, pawn.Map, thing, null, null)
@@ -272,13 +338,24 @@ namespace PickUpAndHaulCECarryFix
                     cell,
                     PathEndMode.ClosestTouch,
                     TraverseParms.For(pawn, Danger.Deadly));
-            var canReserveNow = pawn.CanReserveNew(target);
+            canReserveNow = pawn.CanReserveNew(target);
 
-            return AdaptiveStorageReservationPolicy.ShouldRetryUnload(
-                isAdaptiveStorage,
-                otherwiseEligible,
-                canReserveNow);
+            return true;
         }
+
+        private static StoragePriority StoragePriorityOf(
+            IntVec3 cell,
+            IHaulDestination destination,
+            Map map)
+        {
+            if (cell != IntVec3.Invalid)
+            {
+                return cell.GetSlotGroup(map)?.Settings.Priority ?? StoragePriority.Unstored;
+            }
+
+            return destination?.GetStoreSettings()?.Priority ?? StoragePriority.Unstored;
+        }
+
     }
 
     [HarmonyPatch]

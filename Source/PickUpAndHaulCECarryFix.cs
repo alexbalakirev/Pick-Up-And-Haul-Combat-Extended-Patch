@@ -776,7 +776,7 @@ namespace PickUpAndHaulCECarryFix
                 {
                     var storeTarget = allocation.Key;
                     var accepts = storeTarget.container?.TryGetInnerInteractableThingOwner().CanAcceptAnyOf(nextThing)
-                        ?? storeTarget.cell.GetSlotGroup(map).parent.Accepts(nextThing);
+                        ?? storeTarget.cell.GetSlotGroup(map)?.parent?.Accepts(nextThing) == true;
                     if (accepts && WorkGiver_HaulToInventory.Stackable(nextThing, allocation))
                     {
                         storeCell = storeTarget;
@@ -955,8 +955,8 @@ namespace PickUpAndHaulCECarryFix
                 }
 
                 foundCell = foundCell2;
-                haulDestination = foundCell2.GetSlotGroup(map).parent;
-                return true;
+                haulDestination = foundCell2.GetSlotGroup(map)?.parent;
+                return haulDestination != null;
             }
 
             private bool TryFindBestBetterStoreCellFor(
@@ -978,7 +978,7 @@ namespace PickUpAndHaulCECarryFix
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var candidate = candidates[i];
-                    if (WorkGiver_HaulToInventory.skipCells.Contains(candidate.Cell))
+                    if (WorkGiver_HaulToInventory.skipCells != null && WorkGiver_HaulToInventory.skipCells.Contains(candidate.Cell))
                     {
                         continue;
                     }
@@ -992,7 +992,7 @@ namespace PickUpAndHaulCECarryFix
                     if (StoreUtility.IsGoodStoreCell(candidate.Cell, map, thing, carrier, faction) && candidate.Cell != default)
                     {
                         foundCell = candidate.Cell;
-                        WorkGiver_HaulToInventory.skipCells.Add(candidate.Cell);
+                        WorkGiver_HaulToInventory.skipCells?.Add(candidate.Cell);
                         return true;
                     }
                 }
@@ -1025,7 +1025,7 @@ namespace PickUpAndHaulCECarryFix
                 for (var i = 0; i < candidates.Count; i++)
                 {
                     var destinationThing = candidates[i];
-                    if (destinationThing == null || destinationThing.Destroyed || destinationThing.Faction != faction || WorkGiver_HaulToInventory.skipThings.Contains(destinationThing))
+                    if (destinationThing == null || destinationThing.Destroyed || destinationThing.Faction != faction || (WorkGiver_HaulToInventory.skipThings != null && WorkGiver_HaulToInventory.skipThings.Contains(destinationThing)))
                     {
                         continue;
                     }
@@ -1076,7 +1076,7 @@ namespace PickUpAndHaulCECarryFix
 
                 if (haulDestination is Thing foundThing)
                 {
-                    WorkGiver_HaulToInventory.skipThings.Add(foundThing);
+                    WorkGiver_HaulToInventory.skipThings?.Add(foundThing);
                 }
 
                 return haulDestination != null;
@@ -1645,6 +1645,8 @@ namespace PickUpAndHaulCECarryFix
     [HarmonyPatch]
     public static class Patch_CompatHelper_CanFitInInventory
     {
+        public static bool Prepare() => TargetMethod() != null;
+
         public static MethodBase TargetMethod()
             => AccessTools.Method(AccessTools.TypeByName("PickUpAndHaul.CompatHelper"), "CanFitInInventory");
 
@@ -1663,6 +1665,8 @@ namespace PickUpAndHaulCECarryFix
     [HarmonyPatch]
     public static class Patch_CompatHelper_CeOverweight
     {
+        public static bool Prepare() => TargetMethod() != null;
+
         public static MethodBase TargetMethod()
             => AccessTools.Method(AccessTools.TypeByName("PickUpAndHaul.CompatHelper"), "CeOverweight");
 
@@ -1676,6 +1680,8 @@ namespace PickUpAndHaulCECarryFix
     [HarmonyPatch]
     public static class Patch_CompatHelper_UpdateInventory
     {
+        public static bool Prepare() => TargetMethod() != null;
+
         public static MethodBase TargetMethod()
             => AccessTools.Method(AccessTools.TypeByName("PickUpAndHaul.CompatHelper"), "UpdateInventory");
 
@@ -2090,6 +2096,8 @@ namespace PickUpAndHaulCECarryFix
     [HarmonyPatch]
     public static class Patch_JobDriver_CheckForOverencumberedForCombatExtended
     {
+        public static bool Prepare() => TargetMethod() != null;
+
         public static MethodBase TargetMethod()
         {
             foreach (var nestedType in typeof(JobDriver_HaulToInventory).GetNestedTypes(BindingFlags.NonPublic))

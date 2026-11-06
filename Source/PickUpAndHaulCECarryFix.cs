@@ -32,10 +32,13 @@ namespace PickUpAndHaulCECarryFix
             listing.CheckboxLabeled(
                 "Enable candidate planning performance patch",
                 ref Settings.PerformancePatchEnabled,
-                "Use a bounded opportunistic pickup candidate list instead of Pick Up And Haul's full-list sort and repeated nearest searches.");
+                "Plan opportunistic pickups lazily: score nearby haulables, then validate only the best candidate at each step, instead of Pick Up And Haul's full-list sort and repeated nearest searches.");
             if (Settings.PerformancePatchEnabled)
             {
-                listing.Label($"Opportunistic candidate cap: {Settings.OpportunisticCandidateCap}");
+                listing.Label(
+                    $"Maximum candidate validations per haul plan: {Settings.OpportunisticCandidateCap}",
+                    -1f,
+                    new TipSignal("Upper bound on how many nearby haulables are fully validated (reachability, reservation, storage checks) while planning one multi-item haul. Lower values plan faster in dense piles but may skip valid items farther down the list."));
                 Settings.OpportunisticCandidateCap = (int)Math.Round(listing.Slider(Settings.OpportunisticCandidateCap, 32f, 512f));
             }
 
@@ -49,7 +52,7 @@ namespace PickUpAndHaulCECarryFix
             listing.CheckboxLabeled(
                 "Enable storage and hotpath cleanup",
                 ref Settings.StorageHotpathCleanupEnabled,
-                "Cache per-job storage scan candidates and avoid a few Pick Up And Haul hot-path allocations.");
+                "Use cheaper storage scans while planning hauls, skip needless Pick Up And Haul work, and index reserved Adaptive Storage cells.");
 
             listing.Gap();
             listing.CheckboxLabeled(
@@ -91,19 +94,6 @@ namespace PickUpAndHaulCECarryFix
 
         public static int ClampCandidateCap(int value)
             => RouteOrdering.Clamp(value, MinCandidateCap, MaxCandidateCap);
-
-        public static IEnumerable<Thing> PotentialWorkThingsGlobal(Pawn pawn)
-        {
-            if (pawn?.Map?.listerHaulables == null)
-            {
-                return Enumerable.Empty<Thing>();
-            }
-
-            var list = new List<Thing>(pawn.Map.listerHaulables.ThingsPotentiallyNeedingHauling());
-            var rootCell = pawn.Position;
-            list.Sort((left, right) => (left.Position - rootCell).LengthHorizontalSquared.CompareTo((right.Position - rootCell).LengthHorizontalSquared));
-            return list;
-        }
 
         public static Job TryMakeOptimizedJob(Pawn pawn, Thing thing, bool forced)
         {
@@ -197,6 +187,7 @@ namespace PickUpAndHaulCECarryFix
             }
 
             var nextThingLeftOverCount = 0;
+            var statEvaluations = 0;
             var encumberance = CeInventoryUtility.EncumbrancePercent(pawn);
             var plannedCapacity = CeInventoryUtility.PlannedCapacity.For(pawn);
             job.targetQueueA = new List<LocalTargetInfo>();
@@ -220,8 +211,8 @@ namespace PickUpAndHaulCECarryFix
                 && WorkGiver_HaulToInventory.GoodThingToHaul(t, pawn)
                 && HaulAIUtility.PawnCanAutomaticallyHaulFast(pawn, t, false);
 
-            var haulables = BuildCandidateList(map, thing, storeTarget.Position, distanceToSearchMore, CandidateCap, Validator);
-            var routeScores = new List<RouteScore>(haulables.Count);
+            var candidates = BuildCandidateSet(map, thing, distanceToSearchMore, CandidateCap);
+            var candidatesInRadius = candidates.Count;
 
             var nextThing = thing;
             var lastThing = thing;
@@ -252,7 +243,9 @@ namespace PickUpAndHaulCECarryFix
                         var plannedCount = CeInventoryUtility.LastPlannedCount(job, nextThing);
                         if (plannedCapacity.UsesCeInventory)
                         {
-                            var countThatFits = plannedCapacity.CountThatFits(pawn, nextThing, plannedCount);
+                            var unitCost = plannedCapacity.CostOf(nextThing);
+                            statEvaluations += 2;
+                            var countThatFits = plannedCapacity.CountThatFits(pawn, nextThing, plannedCount, unitCost);
                             if (countThatFits < plannedCount || ceOverweight)
                             {
                                 if (countThatFits <= 0 && job.targetQueueA.Count > 1)
@@ -273,7 +266,7 @@ namespace PickUpAndHaulCECarryFix
                                 break;
                             }
 
-                            plannedCapacity.Add(nextThing, plannedCount);
+                            plannedCapacity.Add(plannedCount, unitCost);
                             encumberance = plannedCapacity.CapacityRatio;
                         }
                         else
@@ -294,30 +287,27 @@ namespace PickUpAndHaulCECarryFix
                         }
                     }
                 }
-                while ((nextThing = GetNextCandidate(lastThing.Position, storeTarget.Position, map, haulables, routeScores,
+                while ((nextThing = GetNextCandidate(lastThing.Position, storeTarget.Position, map, candidates,
                     PathEndMode.ClosestTouch, TraverseParms.For(pawn), distanceToSearchMore, Validator)) != null);
             }
             finally
             {
                 WorkGiver_HaulToInventory.skipCells = null;
                 WorkGiver_HaulToInventory.skipThings = null;
+                PickUpAndHaulAggregateStats.CountOptimizedPlan(candidatesInRadius, candidates.ValidationCalls, statEvaluations);
             }
 
             return job;
         }
 
-        private static List<Thing> BuildCandidateList(
+        private static LazyCandidateSet<Thing> BuildCandidateSet(
             Map map,
             Thing firstThing,
-            IntVec3 destination,
             float maxDistance,
-            int cap,
-            Predicate<Thing> validator)
+            int validationBudget)
         {
-            var candidates = new List<Candidate>(cap);
-            var candidateScores = new List<RouteScore>(cap);
             var maxDistanceSquared = maxDistance * maxDistance;
-            var worstIndex = -1;
+            var candidates = new LazyCandidateSet<Thing>(validationBudget);
 
             foreach (var candidate in map.listerHaulables.ThingsPotentiallyNeedingHauling())
             {
@@ -326,127 +316,43 @@ namespace PickUpAndHaulCECarryFix
                     continue;
                 }
 
-                var distanceSquared = (firstThing.Position - candidate.Position).LengthHorizontalSquared;
-                if (distanceSquared > maxDistanceSquared)
+                if ((firstThing.Position - candidate.Position).LengthHorizontalSquared > maxDistanceSquared)
                 {
                     continue;
                 }
 
-                if (validator != null && !validator(candidate))
-                {
-                    continue;
-                }
-
-                var score = new RouteScore(
-                    distanceSquared,
-                    (destination - candidate.Position).LengthHorizontalSquared,
-                    candidate.thingIDNumber);
-
-                if (candidates.Count < cap)
-                {
-                    candidates.Add(new Candidate(candidate, score));
-                    candidateScores.Add(score);
-                    if (worstIndex < 0 || RouteOrdering.Compare(score, candidateScores[worstIndex]) > 0)
-                    {
-                        worstIndex = candidates.Count - 1;
-                    }
-
-                    continue;
-                }
-
-                if (!RouteOrdering.IsBetter(score, candidateScores[worstIndex]))
-                {
-                    continue;
-                }
-
-                candidates[worstIndex] = new Candidate(candidate, score);
-                candidateScores[worstIndex] = score;
-                worstIndex = RouteOrdering.FindWorstIndex(candidateScores);
+                candidates.Add(candidate);
             }
 
-            candidates.Sort((left, right) => RouteOrdering.Compare(left.Score, right.Score));
-
-            var result = new List<Thing>(candidates.Count);
-            for (var i = 0; i < candidates.Count; i++)
-            {
-                result.Add(candidates[i].Thing);
-            }
-
-            return result;
+            return candidates;
         }
 
         private static Thing GetNextCandidate(
             IntVec3 center,
             IntVec3 destination,
             Map map,
-            List<Thing> searchSet,
-            List<RouteScore> routeScores,
+            LazyCandidateSet<Thing> candidates,
             PathEndMode peMode,
             TraverseParms traverseParams,
             float maxDistance,
             Predicate<Thing> validator)
         {
-            if (searchSet.NullOrEmpty())
-            {
-                return null;
-            }
-
             var maxDistanceSquared = maxDistance * maxDistance;
-            var evaluated = 0;
-            while (searchSet.Count > 0)
-            {
-                for (var i = searchSet.Count - 1; i >= 0; i--)
-                {
-                    if (searchSet[i] == null || !searchSet[i].Spawned)
-                    {
-                        searchSet.RemoveAt(i);
-                    }
-                }
-
-                if (searchSet.Count == 0)
-                {
-                    break;
-                }
-
-                routeScores.Clear();
-                for (var i = 0; i < searchSet.Count; i++)
-                {
-                    var scoredCandidate = searchSet[i];
-                    routeScores.Add(new RouteScore(
-                        (center - scoredCandidate.Position).LengthHorizontalSquared,
-                        (destination - scoredCandidate.Position).LengthHorizontalSquared,
-                        scoredCandidate.thingIDNumber));
-                }
-
-                evaluated += routeScores.Count;
-                var bestIndex = RouteOrdering.FindBestIndex(routeScores);
-                if (bestIndex < 0)
-                {
-                    break;
-                }
-
-                var bestScore = routeScores[bestIndex];
-                var candidate = searchSet[bestIndex];
-                searchSet.RemoveAt(bestIndex);
-                if (bestScore.CurrentDistanceSquared > maxDistanceSquared)
-                {
-                    break;
-                }
-
-                if (!map.reachability.CanReach(center, candidate, peMode, traverseParams))
-                {
-                    continue;
-                }
-
-                if (validator == null || validator(candidate))
-                {
-                    PickUpAndHaulDiagnostics.CountNearestSearch(evaluated);
-                    return candidate;
-                }
-            }
-
+            candidates.TryPickNext(
+                t => t.Spawned
+                    ? new RouteScore(
+                        (center - t.Position).LengthHorizontalSquared,
+                        (destination - t.Position).LengthHorizontalSquared,
+                        t.thingIDNumber)
+                    : new RouteScore(0, 0, t.thingIDNumber),
+                maxDistanceSquared,
+                t => t.Spawned,
+                t => map.reachability.CanReach(center, t, peMode, traverseParams)
+                    && (validator == null || validator(t)),
+                out var picked,
+                out var evaluated);
             PickUpAndHaulDiagnostics.CountNearestSearch(evaluated);
-            return null;
+            return picked;
         }
 
         private static bool HaulToHopperJob(Thing thing, IntVec3 targetCell, Map map)
@@ -466,22 +372,15 @@ namespace PickUpAndHaulCECarryFix
 
             return false;
         }
-
-        private readonly struct Candidate
-        {
-            public readonly Thing Thing;
-            public readonly RouteScore Score;
-
-            public Candidate(Thing thing, RouteScore score)
-            {
-                Thing = thing;
-                Score = score;
-            }
-        }
     }
 
     public static class PickUpAndHaulUnloadRouting
     {
+        private const int DestinationCacheMaxAgeTicks = 600;
+        private const int MaxTrackedPawns = 64;
+
+        private static readonly Dictionary<int, UnloadJobState> States = new Dictionary<int, UnloadJobState>();
+
         public static bool Enabled => PickUpAndHaulCECarryFixMod.Settings?.UnloadRouteOptimizationEnabled == true;
 
         public static bool TrySelectNextUnloadableThing(Pawn pawn, HashSet<Thing> carriedThings, out ThingCount result)
@@ -495,7 +394,6 @@ namespace PickUpAndHaulCECarryFix
 
             var trackedSnapshot = new List<Thing>(carriedThings);
             var candidates = new List<UnloadCandidate>(trackedSnapshot.Count);
-            var scores = new List<RouteScore>(trackedSnapshot.Count);
             var seenActualThings = new HashSet<Thing>();
 
             for (var i = 0; i < trackedSnapshot.Count; i++)
@@ -527,16 +425,28 @@ namespace PickUpAndHaulCECarryFix
                     continue;
                 }
 
+                candidates.Add(new UnloadCandidate(trackedThing, actualThing, isReplacement));
+            }
+
+            var tick = Find.TickManager.TicksGame;
+            var state = GetState(pawn, tick);
+            var searchesBefore = state.Cache.Searches;
+            var searchedThisCall = new Dictionary<Thing, SelectionMemo>();
+            var map = pawn.Map;
+
+            UnloadDestination Search(UnloadCandidate candidate)
+            {
+                var actual = candidate.ActualThing;
                 if (!StoreUtility.TryFindBestBetterStorageFor(
-                    actualThing,
+                    actual,
                     pawn,
-                    pawn.Map,
+                    map,
                     StoragePriority.Unstored,
                     pawn.Faction,
                     out var storageCell,
                     out var haulDestination))
                 {
-                    continue;
+                    return UnloadDestination.None;
                 }
 
                 var destination = storageCell != IntVec3.Invalid
@@ -544,19 +454,25 @@ namespace PickUpAndHaulCECarryFix
                     : haulDestination?.Position ?? IntVec3.Invalid;
                 if (destination == IntVec3.Invalid)
                 {
-                    continue;
+                    return UnloadDestination.None;
                 }
 
-                candidates.Add(new UnloadCandidate(trackedThing, actualThing, destination, isReplacement));
-                scores.Add(new RouteScore(
-                    (pawn.Position - destination).LengthHorizontalSquared,
-                    0,
-                    actualThing.thingIDNumber));
+                searchedThisCall[actual] = new SelectionMemo(actual, storageCell, haulDestination, tick);
+                return new UnloadDestination(true, destination.x, destination.z);
             }
 
-            var bestIndex = RouteOrdering.FindBestIndex(scores);
+            var bestIndex = state.Cache.SelectNearest(
+                candidates,
+                candidate => candidate.ActualThing.def,
+                candidate => candidate.ActualThing.thingIDNumber,
+                Search,
+                pawn.Position.x,
+                pawn.Position.z,
+                tick);
+            PickUpAndHaulAggregateStats.CountUnloadSelection(state.Cache.Searches - searchesBefore);
             if (bestIndex < 0)
             {
+                state.Memo = null;
                 return false;
             }
 
@@ -566,28 +482,149 @@ namespace PickUpAndHaulCECarryFix
                 carriedThings.Remove(selected.TrackedThing);
             }
 
+            // Only a search that ran for this exact item this tick can be reused by the unload toil.
+            state.Memo = searchedThisCall.TryGetValue(selected.ActualThing, out var memo) ? memo : null;
+
             result = new ThingCount(selected.ActualThing, selected.ActualThing.stackCount);
             if (PickUpAndHaulDiagnostics.Enabled)
             {
                 Log.Message(
-                    $"[Pick Up And Haul CE Carry Fix] unload route pawn={pawn} item={selected.ActualThing} destination={selected.Destination} distanceSquared={scores[bestIndex].CurrentDistanceSquared} candidates={candidates.Count}");
+                    $"[Pick Up And Haul CE Carry Fix] unload route pawn={pawn} item={selected.ActualThing} candidates={candidates.Count} searches={state.Cache.Searches - searchesBefore}");
             }
 
             return true;
+        }
+
+        /// <summary>
+        /// Returns the storage target found for <paramref name="thing"/> during this tick's selection when it is still valid,
+        /// so the unload toil does not repeat the storage search.
+        /// </summary>
+        public static bool TryTakeSelectionMemo(Pawn pawn, Thing thing, out IntVec3 cell, out IHaulDestination destination)
+        {
+            cell = IntVec3.Invalid;
+            destination = null;
+            if (!Enabled || pawn?.Map == null || thing == null || !States.TryGetValue(pawn.thingIDNumber, out var state))
+            {
+                return false;
+            }
+
+            var memo = state.Memo;
+            state.Memo = null;
+            if (memo == null || memo.Thing != thing || memo.Tick != Find.TickManager.TicksGame)
+            {
+                return false;
+            }
+
+            var map = pawn.Map;
+            if (memo.Cell != IntVec3.Invalid)
+            {
+                var slotGroup = memo.Cell.GetSlotGroup(map);
+                if (slotGroup == null
+                    || slotGroup.parent == null
+                    || !ReferenceEquals(slotGroup.parent, memo.Destination)
+                    || !slotGroup.parent.Accepts(thing)
+                    || !StoreUtility.IsGoodStoreCell(memo.Cell, map, thing, pawn, pawn.Faction))
+                {
+                    return false;
+                }
+
+                cell = memo.Cell;
+                destination = memo.Destination;
+                return true;
+            }
+
+            if (!(memo.Destination is Thing destinationThing)
+                || destinationThing.Destroyed
+                || !destinationThing.Spawned
+                || destinationThing.Faction != pawn.Faction
+                || !memo.Destination.Accepts(thing)
+                || destinationThing.TryGetInnerInteractableThingOwner() is not { } owner
+                || owner.GetCountCanAccept(thing) <= 0
+                || destinationThing.IsForbidden(pawn)
+                || !pawn.CanReserveNew(destinationThing)
+                || !map.reachability.CanReach(pawn.PositionHeld, destinationThing, PathEndMode.ClosestTouch, TraverseParms.For(pawn)))
+            {
+                return false;
+            }
+
+            destination = memo.Destination;
+            return true;
+        }
+
+        /// <summary>Records the toil's own storage search so later selections rank this item kind by a fresh destination.</summary>
+        public static void RefreshDestination(Pawn pawn, Thing thing, bool found, IntVec3 cell, IHaulDestination destination)
+        {
+            if (!Enabled || pawn == null || thing == null || !States.TryGetValue(pawn.thingIDNumber, out var state))
+            {
+                return;
+            }
+
+            var position = cell != IntVec3.Invalid
+                ? cell
+                : destination?.Position ?? IntVec3.Invalid;
+            var refreshed = found && position != IntVec3.Invalid
+                ? new UnloadDestination(true, position.x, position.z)
+                : UnloadDestination.None;
+            state.Cache.Refresh(thing.def, refreshed, Find.TickManager.TicksGame);
+        }
+
+        private static UnloadJobState GetState(Pawn pawn, int tick)
+        {
+            var jobId = pawn.CurJob?.loadID ?? -1;
+            if (States.TryGetValue(pawn.thingIDNumber, out var state) && state.JobLoadId == jobId)
+            {
+                return state;
+            }
+
+            if (States.Count >= MaxTrackedPawns)
+            {
+                States.Clear();
+            }
+
+            state = new UnloadJobState(jobId, new UnloadDestinationCache<ThingDef>(DestinationCacheMaxAgeTicks));
+            States[pawn.thingIDNumber] = state;
+            return state;
+        }
+
+        private sealed class UnloadJobState
+        {
+            public readonly int JobLoadId;
+            public readonly UnloadDestinationCache<ThingDef> Cache;
+            public SelectionMemo Memo;
+
+            public UnloadJobState(int jobLoadId, UnloadDestinationCache<ThingDef> cache)
+            {
+                JobLoadId = jobLoadId;
+                Cache = cache;
+            }
+        }
+
+        private sealed class SelectionMemo
+        {
+            public readonly Thing Thing;
+            public readonly IntVec3 Cell;
+            public readonly IHaulDestination Destination;
+            public readonly int Tick;
+
+            public SelectionMemo(Thing thing, IntVec3 cell, IHaulDestination destination, int tick)
+            {
+                Thing = thing;
+                Cell = cell;
+                Destination = destination;
+                Tick = tick;
+            }
         }
 
         private readonly struct UnloadCandidate
         {
             public readonly Thing TrackedThing;
             public readonly Thing ActualThing;
-            public readonly IntVec3 Destination;
             public readonly bool IsReplacement;
 
-            public UnloadCandidate(Thing trackedThing, Thing actualThing, IntVec3 destination, bool isReplacement)
+            public UnloadCandidate(Thing trackedThing, Thing actualThing, bool isReplacement)
             {
                 TrackedThing = trackedThing;
                 ActualThing = actualThing;
-                Destination = destination;
                 IsReplacement = isReplacement;
             }
         }
@@ -596,14 +633,14 @@ namespace PickUpAndHaulCECarryFix
     public static class PickUpAndHaulStorageHotpath
     {
         [ThreadStatic]
-        private static PlanningStorageContext current;
+        private static int planningDepth;
 
         private static WorkGiver_HaulToInventory cachedHaulToInventoryWorkGiver;
         private static WorkGiverDef cachedHaulToInventoryWorkGiverDef;
         private static bool lookedForHaulToInventoryWorkGiver;
 
         public static bool Enabled => PickUpAndHaulCECarryFixMod.Settings?.StorageHotpathCleanupEnabled == true;
-        public static bool HasContext => Enabled && current != null;
+        public static bool HasContext => Enabled && planningDepth > 0;
 
         public static void BeginPlanning()
         {
@@ -612,14 +649,14 @@ namespace PickUpAndHaulCECarryFix
                 return;
             }
 
-            current = new PlanningStorageContext(current);
+            planningDepth++;
         }
 
         public static void EndPlanning()
         {
-            if (current != null)
+            if (planningDepth > 0)
             {
-                current = current.Parent;
+                planningDepth--;
             }
         }
 
@@ -636,7 +673,7 @@ namespace PickUpAndHaulCECarryFix
                 return false;
             }
 
-            result = current.AllocateThingAtCell(storeCellCapacity, pawn, nextThing, job);
+            result = AllocateThingAtCell(storeCellCapacity, pawn, nextThing, job);
             return true;
         }
 
@@ -725,6 +762,126 @@ namespace PickUpAndHaulCECarryFix
             return null;
         }
 
+        private static readonly MethodInfo HaulMoreListGetter = AccessTools.PropertyGetter(typeof(JobDriver_HaulToInventory), "TempListForThings");
+        private static List<Thing> haulMoreList;
+        private static bool warnedHaulMoreLookup;
+
+        /// <summary>
+        /// True when <paramref name="searchSet"/> is Pick Up And Haul's "haul more" scratch list
+        /// (JobDriver_HaulToInventory.TempListForThings), which is searched exactly once with a fixed center.
+        /// </summary>
+        public static bool IsHaulMoreList(List<Thing> searchSet)
+        {
+            if (searchSet == null)
+            {
+                return false;
+            }
+
+            if (haulMoreList == null)
+            {
+                if (HaulMoreListGetter == null)
+                {
+                    if (!warnedHaulMoreLookup)
+                    {
+                        warnedHaulMoreLookup = true;
+                        Log.Warning("[Pick Up And Haul CE Carry Fix] Could not find JobDriver_HaulToInventory.TempListForThings; haul-more pre-filtering is disabled.");
+                    }
+
+                    return false;
+                }
+
+                haulMoreList = HaulMoreListGetter.Invoke(null, null) as List<Thing>;
+            }
+
+            return ReferenceEquals(searchSet, haulMoreList);
+        }
+
+        /// <summary>
+        /// Same result as repeatedly taking the closest remaining thing, but drops unspawned and out-of-range things in one
+        /// pass and sorts the rest once. Only valid for a list that is searched a single time with a fixed center.
+        /// Ties keep list order, matching the original strict-less-than nearest search.
+        /// </summary>
+        public static Thing GetClosestAndRemoveSortedOnce(
+            IntVec3 center,
+            Map map,
+            List<Thing> searchSet,
+            PathEndMode peMode,
+            TraverseParms traverseParams,
+            float maxDistance,
+            Predicate<Thing> validator)
+        {
+            if (searchSet == null || searchSet.Count == 0)
+            {
+                return null;
+            }
+
+            var listSize = searchSet.Count;
+            var maxDistanceSquared = maxDistance * maxDistance;
+            var keys = new long[listSize];
+            var things = new Thing[listSize];
+            var kept = 0;
+            for (var i = 0; i < listSize; i++)
+            {
+                var candidate = searchSet[i];
+                if (candidate == null || !candidate.Spawned)
+                {
+                    continue;
+                }
+
+                var distanceSquared = (center - candidate.Position).LengthHorizontalSquared;
+                if (distanceSquared > maxDistanceSquared)
+                {
+                    continue;
+                }
+
+                keys[kept] = ((long)distanceSquared << 32) | (uint)i;
+                things[kept] = candidate;
+                kept++;
+            }
+
+            Array.Sort(keys, things, 0, kept);
+
+            var popped = 0;
+            var validatorCalls = 0;
+            Thing result = null;
+            var resultIndex = -1;
+            for (var k = 0; k < kept; k++)
+            {
+                var candidate = things[k];
+                popped++;
+                if (!map.reachability.CanReach(center, candidate, peMode, traverseParams))
+                {
+                    continue;
+                }
+
+                if (validator != null)
+                {
+                    validatorCalls++;
+                    if (!validator(candidate))
+                    {
+                        continue;
+                    }
+                }
+
+                result = candidate;
+                resultIndex = k;
+                break;
+            }
+
+            // Leave the unvisited things in the list in nearest-first order, like the original.
+            searchSet.Clear();
+            if (resultIndex >= 0)
+            {
+                for (var k = resultIndex + 1; k < kept; k++)
+                {
+                    searchSet.Add(things[k]);
+                }
+            }
+
+            PickUpAndHaulAggregateStats.CountHaulMoreToil(listSize, popped, validatorCalls);
+            return result;
+        }
+
         public static Thing FindClosestThingWithoutLinq(List<Thing> searchSet, IntVec3 center, out int index)
         {
             if (searchSet == null || searchSet.Count == 0)
@@ -751,438 +908,329 @@ namespace PickUpAndHaulCECarryFix
             return closestThing;
         }
 
-        private class PlanningStorageContext
+        private static bool AllocateThingAtCell(
+            Dictionary<WorkGiver_HaulToInventory.StoreTarget, WorkGiver_HaulToInventory.CellAllocation> storeCellCapacity,
+            Pawn pawn,
+            Thing nextThing,
+            Job job)
         {
-            public readonly PlanningStorageContext Parent;
-            private readonly Dictionary<StorageCacheKey, List<SlotCellCandidate>> slotCellCache = new Dictionary<StorageCacheKey, List<SlotCellCandidate>>();
-            private readonly Dictionary<StorageCacheKey, List<Thing>> nonSlotThingCache = new Dictionary<StorageCacheKey, List<Thing>>();
+            var map = pawn.Map;
+            var storeCell = default(WorkGiver_HaulToInventory.StoreTarget);
+            var foundExistingAllocation = false;
 
-            public PlanningStorageContext(PlanningStorageContext parent)
+            foreach (var allocation in storeCellCapacity)
             {
-                Parent = parent;
+                var storeTarget = allocation.Key;
+                var accepts = storeTarget.container?.TryGetInnerInteractableThingOwner().CanAcceptAnyOf(nextThing)
+                    ?? storeTarget.cell.GetSlotGroup(map).parent.Accepts(nextThing);
+                if (accepts && WorkGiver_HaulToInventory.Stackable(nextThing, allocation))
+                {
+                    storeCell = storeTarget;
+                    foundExistingAllocation = true;
+                    break;
+                }
             }
 
-            public bool AllocateThingAtCell(
-                Dictionary<WorkGiver_HaulToInventory.StoreTarget, WorkGiver_HaulToInventory.CellAllocation> storeCellCapacity,
-                Pawn pawn,
-                Thing nextThing,
-                Job job)
+            if (!foundExistingAllocation)
             {
-                var map = pawn.Map;
-                var storeCell = default(WorkGiver_HaulToInventory.StoreTarget);
-                var foundExistingAllocation = false;
-
-                foreach (var allocation in storeCellCapacity)
+                var currentPriority = StoreUtility.CurrentStoragePriorityOf(nextThing);
+                if (TryFindBestBetterStorageFor(nextThing, pawn, map, currentPriority, pawn.Faction, false, out var nextStoreCell, out var haulDestination, out var innerInteractableThingOwner))
                 {
-                    var storeTarget = allocation.Key;
-                    var accepts = storeTarget.container?.TryGetInnerInteractableThingOwner().CanAcceptAnyOf(nextThing)
-                        ?? storeTarget.cell.GetSlotGroup(map).parent.Accepts(nextThing);
-                    if (accepts && WorkGiver_HaulToInventory.Stackable(nextThing, allocation))
-                    {
-                        storeCell = storeTarget;
-                        foundExistingAllocation = true;
-                        break;
-                    }
-                }
-
-                if (!foundExistingAllocation)
-                {
-                    var currentPriority = StoreUtility.CurrentStoragePriorityOf(nextThing);
-                    if (TryFindBestBetterStorageFor(nextThing, pawn, map, currentPriority, pawn.Faction, false, out var nextStoreCell, out var haulDestination, out var innerInteractableThingOwner))
-                    {
-                        if (innerInteractableThingOwner is null)
-                        {
-                            storeCell = new WorkGiver_HaulToInventory.StoreTarget(nextStoreCell);
-                            job.targetQueueB.Add(nextStoreCell);
-                            storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, WorkGiver_HaulToInventory.CapacityAt(nextThing, nextStoreCell, map));
-                            if (PickUpAndHaulDiagnostics.Enabled)
-                            {
-                                Log.Message($"New cell for unstackable {nextThing} = {nextStoreCell}");
-                            }
-                        }
-                        else
-                        {
-                            var destinationAsThing = (Thing)haulDestination;
-                            storeCell = new WorkGiver_HaulToInventory.StoreTarget(destinationAsThing);
-                            job.targetQueueB.Add(destinationAsThing);
-                            storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, innerInteractableThingOwner.GetCountCanAccept(nextThing));
-                            if (PickUpAndHaulDiagnostics.Enabled)
-                            {
-                                Log.Message($"New haulDestination for unstackable {nextThing} = {haulDestination}");
-                            }
-                        }
-                    }
-                    else
-                    {
-                        if (PickUpAndHaulDiagnostics.Enabled)
-                        {
-                            Log.Message($"{nextThing} can't stack with allocated cells");
-                        }
-
-                        if (job.targetQueueA.NullOrEmpty())
-                        {
-                            job.targetQueueA.Add(nextThing);
-                        }
-
-                        return false;
-                    }
-                }
-
-                job.targetQueueA.Add(nextThing);
-                var count = nextThing.stackCount;
-                storeCellCapacity[storeCell].capacity -= count;
-                if (PickUpAndHaulDiagnostics.Enabled)
-                {
-                    Log.Message($"{pawn} allocating {nextThing}:{count}, now {storeCell}:{storeCellCapacity[storeCell].capacity}");
-                }
-
-                while (storeCellCapacity[storeCell].capacity <= 0)
-                {
-                    var capacityOver = -storeCellCapacity[storeCell].capacity;
-                    storeCellCapacity.Remove(storeCell);
-
-                    if (PickUpAndHaulDiagnostics.Enabled)
-                    {
-                        Log.Message($"{pawn} overdone {storeCell} by {capacityOver}");
-                    }
-
-                    if (capacityOver == 0)
-                    {
-                        break;
-                    }
-
-                    var currentPriority = StoreUtility.CurrentStoragePriorityOf(nextThing);
-                    if (TryFindBestBetterStorageFor(nextThing, pawn, map, currentPriority, pawn.Faction, false, out var nextStoreCell, out var nextHaulDestination, out var innerInteractableThingOwner))
-                    {
-                        if (innerInteractableThingOwner is null)
-                        {
-                            storeCell = new WorkGiver_HaulToInventory.StoreTarget(nextStoreCell);
-                            job.targetQueueB.Add(nextStoreCell);
-
-                            var capacity = WorkGiver_HaulToInventory.CapacityAt(nextThing, nextStoreCell, map) - capacityOver;
-                            storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, capacity);
-                            if (PickUpAndHaulDiagnostics.Enabled)
-                            {
-                                Log.Message($"New cell {nextStoreCell}:{capacity}, allocated extra {capacityOver}");
-                            }
-                        }
-                        else
-                        {
-                            var destinationAsThing = (Thing)nextHaulDestination;
-                            storeCell = new WorkGiver_HaulToInventory.StoreTarget(destinationAsThing);
-                            job.targetQueueB.Add(destinationAsThing);
-
-                            var capacity = innerInteractableThingOwner.GetCountCanAccept(nextThing) - capacityOver;
-                            storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, capacity);
-                            if (PickUpAndHaulDiagnostics.Enabled)
-                            {
-                                Log.Message($"New haulDestination {nextHaulDestination}:{capacity}, allocated extra {capacityOver}");
-                            }
-                        }
-                    }
-                    else
-                    {
-                        count -= capacityOver;
-                        job.countQueue.Add(count);
-                        if (PickUpAndHaulDiagnostics.Enabled)
-                        {
-                            Log.Message($"Nowhere else to store, allocated {nextThing}:{count}");
-                        }
-                        return false;
-                    }
-                }
-
-                job.countQueue.Add(count);
-                if (PickUpAndHaulDiagnostics.Enabled)
-                {
-                    Log.Message($"{nextThing}:{count} allocated");
-                }
-                return true;
-            }
-
-            private bool TryFindBestBetterStorageFor(
-                Thing thing,
-                Pawn carrier,
-                Map map,
-                StoragePriority currentPriority,
-                Faction faction,
-                bool acceptSamePriority,
-                out IntVec3 foundCell,
-                out IHaulDestination haulDestination,
-                out ThingOwner innerInteractableThingOwner)
-            {
-                PickUpAndHaulDiagnostics.CountStorageLookupAttempt();
-
-                var storagePriority = StoragePriority.Unstored;
-                innerInteractableThingOwner = null;
-                if (TryFindBestBetterStoreCellFor(thing, carrier, map, currentPriority, faction, acceptSamePriority, out var foundCell2))
-                {
-                    storagePriority = foundCell2.GetSlotGroup(map).Settings.Priority;
-                }
-
-                if (!TryFindBestBetterNonSlotGroupStorageFor(thing, carrier, map, currentPriority, faction, acceptSamePriority, out var haulDestination2))
-                {
-                    haulDestination2 = null;
-                }
-
-                if (storagePriority == StoragePriority.Unstored && haulDestination2 == null)
-                {
-                    foundCell = IntVec3.Invalid;
-                    haulDestination = null;
-                    return false;
-                }
-
-                if (haulDestination2 != null && (storagePriority == StoragePriority.Unstored || (int)haulDestination2.GetStoreSettings().Priority > (int)storagePriority))
-                {
-                    foundCell = IntVec3.Invalid;
-                    haulDestination = haulDestination2;
-
-                    if (haulDestination2 is not Thing destinationAsThing)
-                    {
-                        Log.Error($"{haulDestination2} is not a valid Thing. Pick Up And Haul can't work with this");
-                    }
-                    else
-                    {
-                        innerInteractableThingOwner = destinationAsThing.TryGetInnerInteractableThingOwner();
-                    }
-
                     if (innerInteractableThingOwner is null)
                     {
-                        Log.Error($"{haulDestination2} gave null ThingOwner during lookup in Pick Up And Haul's WorkGiver_HaulToInventory");
+                        storeCell = new WorkGiver_HaulToInventory.StoreTarget(nextStoreCell);
+                        job.targetQueueB.Add(nextStoreCell);
+                        storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, WorkGiver_HaulToInventory.CapacityAt(nextThing, nextStoreCell, map));
+                        if (PickUpAndHaulDiagnostics.Enabled)
+                        {
+                            Log.Message($"New cell for unstackable {nextThing} = {nextStoreCell}");
+                        }
+                    }
+                    else
+                    {
+                        var destinationAsThing = (Thing)haulDestination;
+                        storeCell = new WorkGiver_HaulToInventory.StoreTarget(destinationAsThing);
+                        job.targetQueueB.Add(destinationAsThing);
+                        storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, innerInteractableThingOwner.GetCountCanAccept(nextThing));
+                        if (PickUpAndHaulDiagnostics.Enabled)
+                        {
+                            Log.Message($"New haulDestination for unstackable {nextThing} = {haulDestination}");
+                        }
+                    }
+                }
+                else
+                {
+                    if (PickUpAndHaulDiagnostics.Enabled)
+                    {
+                        Log.Message($"{nextThing} can't stack with allocated cells");
                     }
 
-                    return true;
-                }
+                    if (job.targetQueueA.NullOrEmpty())
+                    {
+                        job.targetQueueA.Add(nextThing);
+                    }
 
-                foundCell = foundCell2;
-                haulDestination = foundCell2.GetSlotGroup(map).parent;
-                return true;
+                    return false;
+                }
             }
 
-            private bool TryFindBestBetterStoreCellFor(
-                Thing thing,
-                Pawn carrier,
-                Map map,
-                StoragePriority currentPriority,
-                Faction faction,
-                bool acceptSamePriority,
-                out IntVec3 foundCell)
+            job.targetQueueA.Add(nextThing);
+            var count = nextThing.stackCount;
+            storeCellCapacity[storeCell].capacity -= count;
+            if (PickUpAndHaulDiagnostics.Enabled)
             {
-                var key = new StorageCacheKey(map, thing.def, currentPriority, faction, acceptSamePriority);
-                if (!slotCellCache.TryGetValue(key, out var candidates))
+                Log.Message($"{pawn} allocating {nextThing}:{count}, now {storeCell}:{storeCellCapacity[storeCell].capacity}");
+            }
+
+            while (storeCellCapacity[storeCell].capacity <= 0)
+            {
+                var capacityOver = -storeCellCapacity[storeCell].capacity;
+                storeCellCapacity.Remove(storeCell);
+
+                if (PickUpAndHaulDiagnostics.Enabled)
                 {
-                    candidates = BuildSlotCellCandidates(map, currentPriority, acceptSamePriority);
-                    slotCellCache[key] = candidates;
+                    Log.Message($"{pawn} overdone {storeCell} by {capacityOver}");
                 }
 
-                for (var i = 0; i < candidates.Count; i++)
+                if (capacityOver == 0)
                 {
-                    var candidate = candidates[i];
-                    if (WorkGiver_HaulToInventory.skipCells.Contains(candidate.Cell))
-                    {
-                        continue;
-                    }
-
-                    var slotGroup = candidate.Cell.GetSlotGroup(map);
-                    if (slotGroup == null || slotGroup.Settings.Priority != candidate.Priority || !slotGroup.parent.Accepts(thing))
-                    {
-                        continue;
-                    }
-
-                    if (StoreUtility.IsGoodStoreCell(candidate.Cell, map, thing, carrier, faction) && candidate.Cell != default)
-                    {
-                        foundCell = candidate.Cell;
-                        WorkGiver_HaulToInventory.skipCells.Add(candidate.Cell);
-                        return true;
-                    }
+                    break;
                 }
 
+                var currentPriority = StoreUtility.CurrentStoragePriorityOf(nextThing);
+                if (TryFindBestBetterStorageFor(nextThing, pawn, map, currentPriority, pawn.Faction, false, out var nextStoreCell, out var nextHaulDestination, out var innerInteractableThingOwner))
+                {
+                    if (innerInteractableThingOwner is null)
+                    {
+                        storeCell = new WorkGiver_HaulToInventory.StoreTarget(nextStoreCell);
+                        job.targetQueueB.Add(nextStoreCell);
+
+                        var capacity = WorkGiver_HaulToInventory.CapacityAt(nextThing, nextStoreCell, map) - capacityOver;
+                        storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, capacity);
+                        if (PickUpAndHaulDiagnostics.Enabled)
+                        {
+                            Log.Message($"New cell {nextStoreCell}:{capacity}, allocated extra {capacityOver}");
+                        }
+                    }
+                    else
+                    {
+                        var destinationAsThing = (Thing)nextHaulDestination;
+                        storeCell = new WorkGiver_HaulToInventory.StoreTarget(destinationAsThing);
+                        job.targetQueueB.Add(destinationAsThing);
+
+                        var capacity = innerInteractableThingOwner.GetCountCanAccept(nextThing) - capacityOver;
+                        storeCellCapacity[storeCell] = new WorkGiver_HaulToInventory.CellAllocation(nextThing, capacity);
+                        if (PickUpAndHaulDiagnostics.Enabled)
+                        {
+                            Log.Message($"New haulDestination {nextHaulDestination}:{capacity}, allocated extra {capacityOver}");
+                        }
+                    }
+                }
+                else
+                {
+                    count -= capacityOver;
+                    job.countQueue.Add(count);
+                    if (PickUpAndHaulDiagnostics.Enabled)
+                    {
+                        Log.Message($"Nowhere else to store, allocated {nextThing}:{count}");
+                    }
+                    return false;
+                }
+            }
+
+            job.countQueue.Add(count);
+            if (PickUpAndHaulDiagnostics.Enabled)
+            {
+                Log.Message($"{nextThing}:{count} allocated");
+            }
+            return true;
+        }
+
+        private static bool TryFindBestBetterStorageFor(
+            Thing thing,
+            Pawn carrier,
+            Map map,
+            StoragePriority currentPriority,
+            Faction faction,
+            bool acceptSamePriority,
+            out IntVec3 foundCell,
+            out IHaulDestination haulDestination,
+            out ThingOwner innerInteractableThingOwner)
+        {
+            PickUpAndHaulDiagnostics.CountStorageLookupAttempt();
+
+            var storagePriority = StoragePriority.Unstored;
+            innerInteractableThingOwner = null;
+            if (TryFindBestBetterStoreCellFor(thing, carrier, map, currentPriority, faction, acceptSamePriority, out var foundCell2))
+            {
+                storagePriority = foundCell2.GetSlotGroup(map).Settings.Priority;
+            }
+
+            if (!TryFindBestBetterNonSlotGroupStorageFor(thing, carrier, map, currentPriority, faction, acceptSamePriority, out var haulDestination2))
+            {
+                haulDestination2 = null;
+            }
+
+            if (storagePriority == StoragePriority.Unstored && haulDestination2 == null)
+            {
                 foundCell = IntVec3.Invalid;
+                haulDestination = null;
                 return false;
             }
 
-            private bool TryFindBestBetterNonSlotGroupStorageFor(
-                Thing thing,
-                Pawn carrier,
-                Map map,
-                StoragePriority currentPriority,
-                Faction faction,
-                bool acceptSamePriority,
-                out IHaulDestination haulDestination)
+            if (haulDestination2 != null && (storagePriority == StoragePriority.Unstored || (int)haulDestination2.GetStoreSettings().Priority > (int)storagePriority))
             {
-                var key = new StorageCacheKey(map, thing.def, currentPriority, faction, acceptSamePriority);
-                if (!nonSlotThingCache.TryGetValue(key, out var candidates))
+                foundCell = IntVec3.Invalid;
+                haulDestination = haulDestination2;
+
+                if (haulDestination2 is not Thing destinationAsThing)
                 {
-                    candidates = BuildNonSlotCandidates(map, currentPriority, acceptSamePriority);
-                    nonSlotThingCache[key] = candidates;
+                    Log.Error($"{haulDestination2} is not a valid Thing. Pick Up And Haul can't work with this");
+                }
+                else
+                {
+                    innerInteractableThingOwner = destinationAsThing.TryGetInnerInteractableThingOwner();
                 }
 
-                var origin = thing.SpawnedOrAnyParentSpawned ? thing.PositionHeld : carrier.PositionHeld;
-                var bestDistance = float.MaxValue;
-                var storagePriority = StoragePriority.Unstored;
-                haulDestination = null;
-
-                for (var i = 0; i < candidates.Count; i++)
+                if (innerInteractableThingOwner is null)
                 {
-                    var destinationThing = candidates[i];
-                    if (destinationThing == null || destinationThing.Destroyed || destinationThing.Faction != faction || WorkGiver_HaulToInventory.skipThings.Contains(destinationThing))
-                    {
-                        continue;
-                    }
-
-                    if (destinationThing is Building_Grave && !thing.CanBeBuried())
-                    {
-                        continue;
-                    }
-
-                    if (destinationThing is IHaulDestination destination)
-                    {
-                        var priority = destination.GetStoreSettings().Priority;
-                        if ((int)priority < (int)storagePriority
-                            || (acceptSamePriority && (int)priority < (int)currentPriority)
-                            || (!acceptSamePriority && (int)priority <= (int)currentPriority))
-                        {
-                            continue;
-                        }
-
-                        var distance = origin.DistanceToSquared(destination.Position);
-                        if (distance > bestDistance || !destination.Accepts(thing))
-                        {
-                            continue;
-                        }
-
-                        if (carrier != null)
-                        {
-                            if (destinationThing.IsForbidden(carrier)
-                                || !carrier.CanReserveNew(destinationThing)
-                                || !carrier.Map.reachability.CanReach(origin, destinationThing, PathEndMode.ClosestTouch, TraverseParms.For(carrier)))
-                            {
-                                continue;
-                            }
-                        }
-                        else if (faction != null)
-                        {
-                            if (destinationThing.IsForbidden(faction) || map.reservationManager.IsReservedByAnyoneOf(destinationThing, faction))
-                            {
-                                continue;
-                            }
-                        }
-
-                        bestDistance = distance;
-                        storagePriority = priority;
-                        haulDestination = destination;
-                    }
+                    Log.Error($"{haulDestination2} gave null ThingOwner during lookup in Pick Up And Haul's WorkGiver_HaulToInventory");
                 }
 
-                if (haulDestination is Thing foundThing)
-                {
-                    WorkGiver_HaulToInventory.skipThings.Add(foundThing);
-                }
-
-                return haulDestination != null;
+                return true;
             }
 
-            private static List<SlotCellCandidate> BuildSlotCellCandidates(Map map, StoragePriority currentPriority, bool acceptSamePriority)
-            {
-                var result = new List<SlotCellCandidate>();
-                var haulDestinations = map.haulDestinationManager.AllGroupsListInPriorityOrder;
-                for (var i = 0; i < haulDestinations.Count; i++)
-                {
-                    var slotGroup = haulDestinations[i];
-                    if (acceptSamePriority ? slotGroup.Settings.Priority < currentPriority : slotGroup.Settings.Priority <= currentPriority)
-                    {
-                        continue;
-                    }
-
-                    var cellsList = slotGroup.CellsList;
-                    for (var j = 0; j < cellsList.Count; j++)
-                    {
-                        result.Add(new SlotCellCandidate(cellsList[j], slotGroup.Settings.Priority));
-                    }
-                }
-
-                return result;
-            }
-
-            private static List<Thing> BuildNonSlotCandidates(Map map, StoragePriority currentPriority, bool acceptSamePriority)
-            {
-                var result = new List<Thing>();
-                var allHaulDestinationsListInPriorityOrder = map.haulDestinationManager.AllHaulDestinationsListInPriorityOrder;
-                for (var i = 0; i < allHaulDestinationsListInPriorityOrder.Count; i++)
-                {
-                    var haulDestination = allHaulDestinationsListInPriorityOrder[i];
-                    if (haulDestination is ISlotGroupParent)
-                    {
-                        continue;
-                    }
-
-                    var priority = haulDestination.GetStoreSettings().Priority;
-                    if (acceptSamePriority ? priority < currentPriority : priority <= currentPriority)
-                    {
-                        continue;
-                    }
-
-                    if (haulDestination is Thing destinationThing)
-                    {
-                        result.Add(destinationThing);
-                    }
-                }
-
-                return result;
-            }
+            foundCell = foundCell2;
+            haulDestination = foundCell2.GetSlotGroup(map).parent;
+            return true;
         }
 
-        private readonly struct StorageCacheKey : IEquatable<StorageCacheKey>
+        private static bool TryFindBestBetterStoreCellFor(
+            Thing thing,
+            Pawn carrier,
+            Map map,
+            StoragePriority currentPriority,
+            Faction faction,
+            bool acceptSamePriority,
+            out IntVec3 foundCell)
         {
-            private readonly Map map;
-            private readonly ThingDef thingDef;
-            private readonly StoragePriority currentPriority;
-            private readonly Faction faction;
-            private readonly bool acceptSamePriority;
-
-            public StorageCacheKey(Map map, ThingDef thingDef, StoragePriority currentPriority, Faction faction, bool acceptSamePriority)
+            var slotGroups = map.haulDestinationManager.AllGroupsListInPriorityOrder;
+            for (var i = 0; i < slotGroups.Count; i++)
             {
-                this.map = map;
-                this.thingDef = thingDef;
-                this.currentPriority = currentPriority;
-                this.faction = faction;
-                this.acceptSamePriority = acceptSamePriority;
-            }
-
-            public bool Equals(StorageCacheKey other)
-                => ReferenceEquals(map, other.map)
-                && ReferenceEquals(thingDef, other.thingDef)
-                && currentPriority == other.currentPriority
-                && ReferenceEquals(faction, other.faction)
-                && acceptSamePriority == other.acceptSamePriority;
-
-            public override bool Equals(object obj)
-                => obj is StorageCacheKey other && Equals(other);
-
-            public override int GetHashCode()
-            {
-                unchecked
+                var slotGroup = slotGroups[i];
+                var priority = slotGroup.Settings.Priority;
+                if (acceptSamePriority ? priority < currentPriority : priority <= currentPriority)
                 {
-                    var hashCode = map != null ? map.GetHashCode() : 0;
-                    hashCode = (hashCode * 397) ^ (thingDef != null ? thingDef.GetHashCode() : 0);
-                    hashCode = (hashCode * 397) ^ (int)currentPriority;
-                    hashCode = (hashCode * 397) ^ (faction != null ? faction.GetHashCode() : 0);
-                    hashCode = (hashCode * 397) ^ acceptSamePriority.GetHashCode();
-                    return hashCode;
+                    continue;
+                }
+
+                // Group-level filters run once per group, not once per cell.
+                if (!slotGroup.parent.Accepts(thing))
+                {
+                    continue;
+                }
+
+                var cellsList = slotGroup.CellsList;
+                for (var j = 0; j < cellsList.Count; j++)
+                {
+                    var cell = cellsList[j];
+                    if (WorkGiver_HaulToInventory.skipCells.Contains(cell))
+                    {
+                        continue;
+                    }
+
+                    if (StoreUtility.IsGoodStoreCell(cell, map, thing, carrier, faction) && cell != default)
+                    {
+                        foundCell = cell;
+                        WorkGiver_HaulToInventory.skipCells.Add(cell);
+                        return true;
+                    }
                 }
             }
+
+            foundCell = IntVec3.Invalid;
+            return false;
         }
 
-        private readonly struct SlotCellCandidate
+        private static bool TryFindBestBetterNonSlotGroupStorageFor(
+            Thing thing,
+            Pawn carrier,
+            Map map,
+            StoragePriority currentPriority,
+            Faction faction,
+            bool acceptSamePriority,
+            out IHaulDestination haulDestination)
         {
-            public readonly IntVec3 Cell;
-            public readonly StoragePriority Priority;
+            var destinations = map.haulDestinationManager.AllHaulDestinationsListInPriorityOrder;
+            var origin = thing.SpawnedOrAnyParentSpawned ? thing.PositionHeld : carrier.PositionHeld;
+            var bestDistance = float.MaxValue;
+            var storagePriority = StoragePriority.Unstored;
+            haulDestination = null;
 
-            public SlotCellCandidate(IntVec3 cell, StoragePriority priority)
+            for (var i = 0; i < destinations.Count; i++)
             {
-                Cell = cell;
-                Priority = priority;
+                var destination = destinations[i];
+                if (destination is ISlotGroupParent)
+                {
+                    continue;
+                }
+
+                // The list is ordered by descending priority, so the first destination below the thresholds ends the search.
+                var priority = destination.GetStoreSettings().Priority;
+                if ((int)priority < (int)storagePriority
+                    || (acceptSamePriority && (int)priority < (int)currentPriority)
+                    || (!acceptSamePriority && (int)priority <= (int)currentPriority))
+                {
+                    break;
+                }
+
+                if (!(destination is Thing destinationThing)
+                    || destinationThing.Destroyed
+                    || destinationThing.Faction != faction
+                    || WorkGiver_HaulToInventory.skipThings.Contains(destinationThing))
+                {
+                    continue;
+                }
+
+                if (destinationThing is Building_Grave && !thing.CanBeBuried())
+                {
+                    continue;
+                }
+
+                var distance = origin.DistanceToSquared(destination.Position);
+                if (distance > bestDistance || !destination.Accepts(thing))
+                {
+                    continue;
+                }
+
+                if (carrier != null)
+                {
+                    if (destinationThing.IsForbidden(carrier)
+                        || !carrier.CanReserveNew(destinationThing)
+                        || !carrier.Map.reachability.CanReach(origin, destinationThing, PathEndMode.ClosestTouch, TraverseParms.For(carrier)))
+                    {
+                        continue;
+                    }
+                }
+                else if (faction != null)
+                {
+                    if (destinationThing.IsForbidden(faction) || map.reservationManager.IsReservedByAnyoneOf(destinationThing, faction))
+                    {
+                        continue;
+                    }
+                }
+
+                bestDistance = distance;
+                storagePriority = priority;
+                haulDestination = destination;
             }
+
+            if (haulDestination is Thing foundThing)
+            {
+                WorkGiver_HaulToInventory.skipThings.Add(foundThing);
+            }
+
+            return haulDestination != null;
         }
     }
 
@@ -1540,18 +1588,31 @@ namespace PickUpAndHaulCECarryFix
                 return new PlannedCapacity(inventory);
             }
 
-            public void Add(Thing thing, int count)
+            /// <summary>Reads mass and bulk once for a candidate; pass the result to <see cref="CountThatFits"/> and <see cref="Add"/>.</summary>
+            internal UnitCost CostOf(Thing thing)
             {
-                if (!usesCeInventory || thing == null || count <= 0)
+                if (!usesCeInventory || thing == null)
+                {
+                    return default;
+                }
+
+                var mass = capacityWeight > 0f ? thing.GetStatValue(StatDefOf.Mass) : 0f;
+                var bulk = capacityBulk > 0f && bulkDef != null ? thing.GetStatValue(bulkDef) : 0f;
+                return new UnitCost(mass, bulk);
+            }
+
+            internal void Add(int count, UnitCost cost)
+            {
+                if (!usesCeInventory || count <= 0)
                 {
                     return;
                 }
 
-                weightRatio += AddedWeightRatio(thing, count);
-                bulkRatio += AddedBulkRatio(thing, count);
+                weightRatio += CapacityMath.AddedRatio(count, cost.MassPerUnit, capacityWeight);
+                bulkRatio += CapacityMath.AddedRatio(count, cost.BulkPerUnit, capacityBulk);
             }
 
-            public int CountThatFits(Pawn pawn, Thing thing, int maxCount)
+            internal int CountThatFits(Pawn pawn, Thing thing, int maxCount, UnitCost cost)
             {
                 if (!usesCeInventory || thing == null || maxCount <= 0)
                 {
@@ -1560,45 +1621,13 @@ namespace PickUpAndHaulCECarryFix
 
                 maxCount = Math.Min(maxCount, thing.stackCount);
                 var countFromCapacity = Math.Min(
-                    CountByDimension(weightRatio, AddedWeightRatio(thing, 1), maxCount),
-                    CountByDimension(bulkRatio, AddedBulkRatio(thing, 1), maxCount));
-                return CeInventoryUtility.CountThatFits(pawn, thing, countFromCapacity);
-            }
+                    CapacityMath.CountByDimension(weightRatio, CapacityMath.AddedRatio(1, cost.MassPerUnit, capacityWeight), maxCount),
+                    CapacityMath.CountByDimension(bulkRatio, CapacityMath.AddedRatio(1, cost.BulkPerUnit, capacityBulk), maxCount));
 
-            private float AddedWeightRatio(Thing thing, int count)
-            {
-                if (capacityWeight <= 0f)
-                {
-                    return 0f;
-                }
-
-                return count * thing.GetStatValue(StatDefOf.Mass) / capacityWeight;
-            }
-
-            private float AddedBulkRatio(Thing thing, int count)
-            {
-                if (capacityBulk <= 0f || bulkDef == null)
-                {
-                    return 0f;
-                }
-
-                return count * thing.GetStatValue(bulkDef) / capacityBulk;
-            }
-
-            private static int CountByDimension(float currentRatio, float addedRatioPerUnit, int maxCount)
-            {
-                if (addedRatioPerUnit <= 0f)
-                {
-                    return maxCount;
-                }
-
-                var remainingRatio = 1f - currentRatio;
-                if (remainingRatio <= 0f)
-                {
-                    return 0;
-                }
-
-                return Math.Max(0, Math.Min(maxCount, (int)Math.Floor((remainingRatio + 0.0001f) / addedRatioPerUnit)));
+                // CE's CanFitInInventory is still needed for equipment-specific rules, but only when something is planned.
+                return countFromCapacity <= 0
+                    ? 0
+                    : CeInventoryUtility.CountThatFits(pawn, thing, countFromCapacity);
             }
         }
 
@@ -1736,21 +1765,6 @@ namespace PickUpAndHaulCECarryFix
         }
     }
 
-    [HarmonyPatch(typeof(WorkGiver_HaulToInventory), nameof(WorkGiver_HaulToInventory.PotentialWorkThingsGlobal))]
-    public static class Patch_WorkGiver_PotentialWorkThingsGlobal
-    {
-        public static bool Prefix(Pawn pawn, ref IEnumerable<Thing> __result)
-        {
-            if (!PickUpAndHaulPerformance.Enabled)
-            {
-                return true;
-            }
-
-            __result = PickUpAndHaulPerformance.PotentialWorkThingsGlobal(pawn);
-            return false;
-        }
-    }
-
     [HarmonyPatch]
     public static class Patch_JobDriver_UnloadYourHauledInventory_FirstUnloadableThing
     {
@@ -1852,7 +1866,9 @@ namespace PickUpAndHaulCECarryFix
             return false;
         }
 
-        public static void Postfix(PickUpAndHaulDiagnostics.PlanningSample __state, Job __result)
+        // A finalizer (not a postfix) so the planning depth and diagnostics sample are unwound even when planning throws;
+        // otherwise the AllocateThingAtCell replacement would stay active outside JobOnThing.
+        public static void Finalizer(PickUpAndHaulDiagnostics.PlanningSample __state, Job __result)
         {
             PickUpAndHaulStorageHotpath.EndPlanning();
             PickUpAndHaulDiagnostics.EndPlanning(__state, __result);
@@ -1883,29 +1899,67 @@ namespace PickUpAndHaulCECarryFix
         }
     }
 
+    /// <summary>
+    /// Replaces Pick Up And Haul's four-condition HasJobOnThing (WorkGiver_HaulToInventory.cs) so the cheap checks run
+    /// once and the Adaptive Storage reservation-blocked fallback is only evaluated after the normal storage search fails.
+    /// Runs only when the fallback can apply; otherwise the original method runs untouched.
+    /// </summary>
     [HarmonyPatch(typeof(WorkGiver_HaulToInventory), nameof(WorkGiver_HaulToInventory.HasJobOnThing))]
     public static class Patch_WorkGiver_HasJobOnThing_AdaptiveStorageReservation
     {
-        public static void Postfix(Pawn pawn, Thing thing, bool forced, ref bool __result)
+        public static bool Prefix(Pawn pawn, Thing thing, bool forced, ref bool __result)
         {
-            if (__result
-                || !PickUpAndHaulPerformance.Enabled
-                || pawn?.Map == null
-                || thing == null
-                || !WorkGiver_HaulToInventory.OkThingToHaul(thing, pawn)
+            // The fallback result is only turned into a job by the optimized JobOnThing path, so both gates must hold.
+            if (!AdaptiveStorageIndex.Active || !PickUpAndHaulPerformance.Enabled || pawn?.Map == null || thing == null)
+            {
+                return true;
+            }
+
+            var startTimestamp = PickUpAndHaulAggregateStats.BeginTimer();
+            __result = Evaluate(pawn, thing, forced);
+            PickUpAndHaulAggregateStats.EndHasJobOnThing(startTimestamp);
+            return false;
+        }
+
+        private static bool Evaluate(Pawn pawn, Thing thing, bool forced)
+        {
+            if (!WorkGiver_HaulToInventory.OkThingToHaul(thing, pawn)
                 || !WorkGiver_HaulToInventory.IsNotCorpseOrAllowed(thing)
                 || !HaulAIUtility.PawnCanAutomaticallyHaulFast(pawn, thing, forced))
             {
-                return;
+                return false;
             }
 
-            __result = AdaptiveStorageReservationCompatibility.TryFindPlanningFallback(
+            var currentPriority = StoreUtility.CurrentStoragePriorityOf(thing);
+            if (StoreUtility.TryFindBestBetterStorageFor(thing, pawn, pawn.Map, currentPriority, pawn.Faction, out _, out _, false))
+            {
+                return true;
+            }
+
+            return AdaptiveStorageReservationCompatibility.TryFindPlanningFallback(
                 thing,
                 pawn,
-                StoreUtility.CurrentStoragePriorityOf(thing),
+                currentPriority,
                 logSelection: false,
                 out _,
                 out _);
+        }
+    }
+
+    /// <summary>Times HasJobOnThing for the aggregate diagnostics when the fallback prefix above does not take over.</summary>
+    [HarmonyPatch(typeof(WorkGiver_HaulToInventory), nameof(WorkGiver_HaulToInventory.HasJobOnThing))]
+    public static class Patch_WorkGiver_HasJobOnThing_Timing
+    {
+        public static void Prefix(ref long __state)
+        {
+            __state = AdaptiveStorageIndex.Active && PickUpAndHaulPerformance.Enabled
+                ? 0L
+                : PickUpAndHaulAggregateStats.BeginTimer();
+        }
+
+        public static void Postfix(long __state)
+        {
+            PickUpAndHaulAggregateStats.EndHasJobOnThing(__state);
         }
     }
 
@@ -1945,6 +1999,12 @@ namespace PickUpAndHaulCECarryFix
             if (!PickUpAndHaulStorageHotpath.Enabled)
             {
                 return true;
+            }
+
+            if (PickUpAndHaulStorageHotpath.IsHaulMoreList(searchSet))
+            {
+                __result = PickUpAndHaulStorageHotpath.GetClosestAndRemoveSortedOnce(center, map, searchSet, peMode, traverseParams, maxDistance, validator);
+                return false;
             }
 
             __result = PickUpAndHaulStorageHotpath.GetClosestAndRemoveWithoutLinq(center, map, searchSet, peMode, traverseParams, maxDistance, validator);
@@ -2120,6 +2180,93 @@ namespace PickUpAndHaulCECarryFix
                     yield return instruction;
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Pick Up And Haul runs RemoveWhere on the hauled-item set on every GetHashSet call, even when nothing is null.
+    /// Run it only when the set actually contains a null entry (an O(1) check); the resulting set is identical.
+    /// </summary>
+    [HarmonyPatch]
+    public static class Patch_CompHauledToInventory_GetHashSet
+    {
+        private static readonly FieldInfo TakenField = AccessTools.Field(typeof(CompHauledToInventory), "takenToInventory");
+        private static AccessTools.FieldRef<CompHauledToInventory, HashSet<Thing>> takenRef;
+
+        public static bool Prepare()
+        {
+            if (TakenField != null && TakenField.FieldType == typeof(HashSet<Thing>))
+            {
+                takenRef = AccessTools.FieldRefAccess<CompHauledToInventory, HashSet<Thing>>("takenToInventory");
+                return true;
+            }
+
+            Log.Warning("[Pick Up And Haul CE Carry Fix] Could not find CompHauledToInventory.takenToInventory; the GetHashSet shortcut is disabled.");
+            return false;
+        }
+
+        public static MethodBase TargetMethod()
+            => AccessTools.Method(typeof(CompHauledToInventory), nameof(CompHauledToInventory.GetHashSet));
+
+        public static bool Prefix(CompHauledToInventory __instance, ref HashSet<Thing> __result)
+        {
+            if (!PickUpAndHaulStorageHotpath.Enabled || __instance == null)
+            {
+                return true;
+            }
+
+            var set = takenRef(__instance);
+            if (set == null)
+            {
+                return true;
+            }
+
+            if (set.Contains(null))
+            {
+                set.RemoveWhere(x => x == null);
+            }
+
+            __result = set;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// CheckIfPawnShouldUnloadInventory allocates a job before it checks whether the pawn has anything to unload, and it runs on
+    /// every pass of the colonist AI decision loop. Skip the original under exactly its early-return conditions.
+    /// </summary>
+    [HarmonyPatch(typeof(PawnUnloadChecker), nameof(PawnUnloadChecker.CheckIfPawnShouldUnloadInventory))]
+    public static class Patch_PawnUnloadChecker_EarlyOut
+    {
+        public static bool Prefix(Pawn pawn)
+        {
+            if (!PickUpAndHaulStorageHotpath.Enabled)
+            {
+                return true;
+            }
+
+            var comp = pawn?.GetComp<CompHauledToInventory>();
+            if (comp == null)
+            {
+                return false;
+            }
+
+            var carriedThing = comp.GetHashSet();
+            if (pawn.Faction != Faction.OfPlayerSilentFail
+                || !PickUpAndHaul.Settings.IsAllowedRace(pawn.RaceProps)
+                || carriedThing == null
+                || carriedThing.Count == 0)
+            {
+                return false;
+            }
+
+            var inventoryContainer = pawn.inventory?.innerContainer;
+            if (inventoryContainer == null)
+            {
+                return true;
+            }
+
+            return inventoryContainer.Count != 0;
         }
     }
 }

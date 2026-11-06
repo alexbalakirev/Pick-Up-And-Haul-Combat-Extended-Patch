@@ -1,0 +1,9 @@
+<Project>
+  <PropertyGroup>
+    <RimWorldVersion Condition="'$(RimWorldVersion)' == ''">1.7</RimWorldVersion>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'PickUpAndHaulCECarryFix'">
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj/**;bin/**</DefaultItemExcludes>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)obj\$(RimWorldVersion)\</BaseIntermediateOutputPath>
+  </PropertyGroup>
+</Project>

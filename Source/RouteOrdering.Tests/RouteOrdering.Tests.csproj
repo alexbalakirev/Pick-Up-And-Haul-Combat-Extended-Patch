@@ -20,6 +20,22 @@
     <DefineConstants>$(DefineConstants);HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY</DefineConstants>
   </PropertyGroup>
 
+  <PropertyGroup Condition="Exists('..\CandidateSelection.cs')">
+    <DefineConstants>$(DefineConstants);HAS_CANDIDATE_SELECTION</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('..\CapacityMath.cs')">
+    <DefineConstants>$(DefineConstants);HAS_CAPACITY_MATH</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('..\UnloadDestinationCache.cs')">
+    <DefineConstants>$(DefineConstants);HAS_UNLOAD_DESTINATION_CACHE</DefineConstants>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="Exists('..\AdaptiveStorageTypeMemo.cs')">
+    <DefineConstants>$(DefineConstants);HAS_ADAPTIVE_TYPE_MEMO</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup Condition="Exists('..\RouteOrdering.cs')">
     <Compile Include="..\RouteOrdering.cs" Link="RouteOrdering.cs" />
   </ItemGroup>
@@ -30,6 +46,22 @@
 
   <ItemGroup Condition="Exists('..\AdaptiveStorageReservationPolicy.cs')">
     <Compile Include="..\AdaptiveStorageReservationPolicy.cs" Link="AdaptiveStorageReservationPolicy.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\CandidateSelection.cs')">
+    <Compile Include="..\CandidateSelection.cs" Link="CandidateSelection.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\CapacityMath.cs')">
+    <Compile Include="..\CapacityMath.cs" Link="CapacityMath.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\UnloadDestinationCache.cs')">
+    <Compile Include="..\UnloadDestinationCache.cs" Link="UnloadDestinationCache.cs" />
+  </ItemGroup>
+
+  <ItemGroup Condition="Exists('..\AdaptiveStorageTypeMemo.cs')">
+    <Compile Include="..\AdaptiveStorageTypeMemo.cs" Link="AdaptiveStorageTypeMemo.cs" />
   </ItemGroup>
 
 </Project>

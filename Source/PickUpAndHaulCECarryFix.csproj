@@ -1,16 +1,50 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net48</TargetFramework>
+    <TargetFramework Condition="'$(RimWorldVersion)' == '1.6'">net48</TargetFramework>
     <AssemblyName>PickUpAndHaulCECarryFix</AssemblyName>
     <RootNamespace>PickUpAndHaulCECarryFix</RootNamespace>
     <OutputType>Library</OutputType>
-    <OutputPath>..\Assemblies\</OutputPath>
+    <OutputPath>..\$(RimWorldVersion)\Assemblies\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
   </PropertyGroup>
+
+  <ItemGroup Condition="'$(RimWorldVersion)' == '1.6'">
+    <PackageReference Include="Krafs.Rimworld.Ref" Version="1.6.4871" ExcludeAssets="runtime" PrivateAssets="all" />
+  </ItemGroup>
+
+  <!--
+    1.7 runs on a CoreCLR (net10) fork and Krafs.Rimworld.Ref 1.7 publishes net10.0 reference assemblies only,
+    which a net48 project cannot restore. The installed SDK cannot target net10.0, so 1.7 is compiled as net8.0 with
+    the implicit framework disabled and the net10 reference pack plus the Krafs 1.7 references added explicitly.
+    PackageDownload only places the packages in the NuGet cache; it does not apply a compatibility check.
+  -->
+  <PropertyGroup Condition="'$(RimWorldVersion)' != '1.6'">
+    <TargetFramework>net8.0</TargetFramework>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+    <NoStdLib>true</NoStdLib>
+    <GenerateDependencyFile>false</GenerateDependencyFile>
+    <NetRefPackVersion>10.0.14</NetRefPackVersion>
+    <KrafsRefVersion>1.7.5000-unstable</KrafsRefVersion>
+    <NetRefPackDir>$(NuGetPackageRoot)microsoft.netcore.app.ref\$(NetRefPackVersion)\ref\net10.0\</NetRefPackDir>
+    <KrafsRefDir>$(NuGetPackageRoot)krafs.rimworld.ref\$(KrafsRefVersion)\ref\net10.0\</KrafsRefDir>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(RimWorldVersion)' != '1.6'">
+    <PackageDownload Include="Microsoft.NETCore.App.Ref" Version="[$(NetRefPackVersion)]" />
+    <PackageDownload Include="Krafs.Rimworld.Ref" Version="[$(KrafsRefVersion)]" />
+  </ItemGroup>
+
+  <Target Name="IncludeNet10References" BeforeTargets="ResolveAssemblyReferences;FindReferenceAssembliesForReferences" Condition="'$(RimWorldVersion)' != '1.6'">
+    <ItemGroup>
+      <Reference Include="$(NetRefPackDir)*.dll" Private="false" />
+      <Reference Include="$(KrafsRefDir)*.dll" Private="false" Exclude="$(KrafsRefDir)System.*.dll;$(KrafsRefDir)Microsoft.*.dll" />
+    </ItemGroup>
+  </Target>
 
   <ItemGroup>
     <Compile Remove="RouteOrdering.Tests\**\*.cs" />
@@ -18,15 +52,7 @@
 
   <ItemGroup>
     <Reference Include="0Harmony">
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\workshop\content\294100\2009463077\Current\Assemblies\0Harmony.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="Assembly-CSharp">
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\Assembly-CSharp.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine.CoreModule">
-      <HintPath>C:\Program Files (x86)\Steam\steamapps\common\RimWorld\RimWorldWin64_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>C:\Program Files (x86)\Steam\steamapps\workshop\content\294100\2009463077\$(RimWorldVersion)\Assemblies\0Harmony.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="IHoldMultipleThings">

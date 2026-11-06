@@ -49,7 +49,7 @@ namespace PickUpAndHaulCECarryFix
                 var target = job.targetQueueB[i];
                 if (ShouldReserveDuringGather(target, pawn.Map))
                 {
-                    pawn.Reserve(target, job);
+                    pawn.Reserve(target, job, errorOnFailed: false);
                 }
             }
         }
@@ -177,7 +177,24 @@ namespace PickUpAndHaulCECarryFix
             JobDriver_UnloadYourHauledInventory driver,
             HashSet<Thing> carriedThings)
         {
-            var plannedTarget = driver?.job?.targetB ?? LocalTargetInfo.Invalid;
+            // PUAH creates the unload job as MakeJob(Unload, storeCell), so the planned cell is targetA. targetA is overwritten by
+            // each selection, so persist it in targetC (saved with the job; vanilla only writes targetC when targetQueueB is
+            // non-empty, which this job never fills).
+            var plannedTarget = LocalTargetInfo.Invalid;
+            var plannedJob = driver?.job;
+            if (plannedJob != null)
+            {
+                if (!plannedJob.targetC.IsValid && plannedJob.targetA.IsValid && !plannedJob.targetA.HasThing)
+                {
+                    plannedJob.targetC = plannedJob.targetA;
+                }
+
+                if (plannedJob.targetC.IsValid && !plannedJob.targetC.HasThing)
+                {
+                    plannedTarget = plannedJob.targetC;
+                }
+            }
+
             var nextAttemptTick = 0;
             var lastFullAttemptTick = int.MinValue;
             var waitingForReservation = false;

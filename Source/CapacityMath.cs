@@ -30,6 +30,9 @@ namespace PickUpAndHaulCECarryFix
             return count * perUnit / capacity;
         }
 
+        /// <summary>True when a planned ratio has reached 1 within float error, so an exact fill counts as full.</summary>
+        public static bool IsFull(float ratio) => ratio >= 1f - Epsilon;
+
         /// <summary>How many units still fit in one capacity dimension without exceeding a ratio of 1.</summary>
         public static int CountByDimension(float currentRatio, float addedRatioPerUnit, int maxCount)
         {

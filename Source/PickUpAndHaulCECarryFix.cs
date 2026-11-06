@@ -233,58 +233,84 @@ namespace PickUpAndHaulCECarryFix
                 WorkGiver_HaulToInventory.skipCells.Add(storeTarget.cell);
             }
 
+            // Charges one queued item against the inventory budget. Returns true when planning must stop after this item.
+            // Used both for a fully allocated item and for one queued with a storage-limited partial count.
+            bool CommitQueuedItem(Thing item, int queueBCountBefore)
+            {
+                lastThing = item;
+                var plannedCount = CeInventoryUtility.LastPlannedCount(job, item);
+                if (plannedCapacity.UsesCeInventory)
+                {
+                    var unitCost = plannedCapacity.CostOf(item);
+                    statEvaluations += 2;
+                    var countThatFits = plannedCapacity.CountThatFits(pawn, item, plannedCount, unitCost);
+                    if (countThatFits < plannedCount || ceOverweight)
+                    {
+                        if (countThatFits <= 0 && job.targetQueueA.Count > 1)
+                        {
+                            job.targetQueueA.RemoveAt(job.targetQueueA.Count - 1);
+                            job.countQueue.RemoveAt(job.countQueue.Count - 1);
+
+                            // Drop the destinations this item added so they are not left reserved for nothing.
+                            var addedToQueueB = job.targetQueueB.Count - queueBCountBefore;
+                            if (addedToQueueB > 0)
+                            {
+                                job.targetQueueB.RemoveRange(queueBCountBefore, addedToQueueB);
+                            }
+
+                            return true;
+                        }
+
+                        nextThingLeftOverCount = Math.Max(1, countThatFits);
+                        job.countQueue.Pop();
+                        job.countQueue.Add(nextThingLeftOverCount);
+                        if (PickUpAndHaulDiagnostics.Enabled)
+                        {
+                            Log.Message($"Inventory allocated, will carry {item}:{nextThingLeftOverCount}");
+                        }
+
+                        return true;
+                    }
+
+                    plannedCapacity.Add(plannedCount, unitCost);
+                    encumberance = plannedCapacity.CapacityRatio;
+
+                    // Exact fill (within float error) keeps the full planned count; the scalar CountPastCapacity path is not needed.
+                    return CapacityMath.IsFull(encumberance);
+                }
+
+                encumberance += CeInventoryUtility.AddedEncumbrance(pawn, item);
+                if (encumberance > 1 || ceOverweight)
+                {
+                    nextThingLeftOverCount = WorkGiver_HaulToInventory.CountPastCapacity(pawn, item, encumberance);
+                    job.countQueue.Pop();
+                    job.countQueue.Add(nextThingLeftOverCount);
+                    if (PickUpAndHaulDiagnostics.Enabled)
+                    {
+                        Log.Message($"Inventory allocated, will carry {item}:{nextThingLeftOverCount}");
+                    }
+
+                    return true;
+                }
+
+                return false;
+            }
+
             try
             {
                 do
                 {
-                    if (WorkGiver_HaulToInventory.AllocateThingAtCell(storeCellCapacity, pawn, nextThing, job))
+                    var queueACountBefore = job.targetQueueA.Count;
+                    var queueBCountBefore = job.targetQueueB.Count;
+                    var allocated = WorkGiver_HaulToInventory.AllocateThingAtCell(storeCellCapacity, pawn, nextThing, job);
+
+                    // AllocateThingAtCell returns false but still queues the item when storage can take only part of it.
+                    var queuedPartial = !allocated
+                        && job.targetQueueA.Count > queueACountBefore
+                        && job.countQueue.Count == job.targetQueueA.Count;
+                    if ((allocated || queuedPartial) && CommitQueuedItem(nextThing, queueBCountBefore))
                     {
-                        lastThing = nextThing;
-                        var plannedCount = CeInventoryUtility.LastPlannedCount(job, nextThing);
-                        if (plannedCapacity.UsesCeInventory)
-                        {
-                            var unitCost = plannedCapacity.CostOf(nextThing);
-                            statEvaluations += 2;
-                            var countThatFits = plannedCapacity.CountThatFits(pawn, nextThing, plannedCount, unitCost);
-                            if (countThatFits < plannedCount || ceOverweight)
-                            {
-                                if (countThatFits <= 0 && job.targetQueueA.Count > 1)
-                                {
-                                    job.targetQueueA.RemoveAt(job.targetQueueA.Count - 1);
-                                    job.countQueue.RemoveAt(job.countQueue.Count - 1);
-                                    break;
-                                }
-
-                                nextThingLeftOverCount = Math.Max(1, countThatFits);
-                                job.countQueue.Pop();
-                                job.countQueue.Add(nextThingLeftOverCount);
-                                if (PickUpAndHaulDiagnostics.Enabled)
-                                {
-                                    Log.Message($"Inventory allocated, will carry {nextThing}:{nextThingLeftOverCount}");
-                                }
-
-                                break;
-                            }
-
-                            plannedCapacity.Add(plannedCount, unitCost);
-                            encumberance = plannedCapacity.CapacityRatio;
-                        }
-                        else
-                        {
-                            encumberance += CeInventoryUtility.AddedEncumbrance(pawn, nextThing);
-                        }
-
-                        if (encumberance > 1 || ceOverweight)
-                        {
-                            nextThingLeftOverCount = WorkGiver_HaulToInventory.CountPastCapacity(pawn, nextThing, encumberance);
-                            job.countQueue.Pop();
-                            job.countQueue.Add(nextThingLeftOverCount);
-                            if (PickUpAndHaulDiagnostics.Enabled)
-                            {
-                                Log.Message($"Inventory allocated, will carry {nextThing}:{nextThingLeftOverCount}");
-                            }
-                            break;
-                        }
+                        break;
                     }
                 }
                 while ((nextThing = GetNextCandidate(lastThing.Position, storeTarget.Position, map, candidates,
@@ -383,6 +409,21 @@ namespace PickUpAndHaulCECarryFix
 
         public static bool Enabled => PickUpAndHaulCECarryFixMod.Settings?.UnloadRouteOptimizationEnabled == true;
 
+        /// <summary>
+        /// Removes tracked hauled entries that are no longer in the pawn's inventory (merged away or destroyed). Pick Up And Haul would
+        /// otherwise substitute the first inventory stack of the same def, which may be one of the pawn's own stacks.
+        /// </summary>
+        public static void PruneStaleTrackedThings(Pawn pawn, HashSet<Thing> carriedThings)
+        {
+            var inventory = pawn?.inventory?.innerContainer;
+            if (inventory == null || carriedThings == null || carriedThings.Count == 0)
+            {
+                return;
+            }
+
+            carriedThings.RemoveWhere(tracked => tracked == null || !inventory.Contains(tracked));
+        }
+
         public static bool TrySelectNextUnloadableThing(Pawn pawn, HashSet<Thing> carriedThings, out ThingCount result)
         {
             result = default;
@@ -404,28 +445,14 @@ namespace PickUpAndHaulCECarryFix
                     continue;
                 }
 
-                var actualThing = trackedThing;
-                var isReplacement = !inventory.Contains(actualThing);
-                if (isReplacement)
-                {
-                    actualThing = null;
-                    for (var j = 0; j < inventory.Count; j++)
-                    {
-                        var inventoryThing = inventory[j];
-                        if (inventoryThing.def == trackedThing.def && !seenActualThings.Contains(inventoryThing))
-                        {
-                            actualThing = inventoryThing;
-                            break;
-                        }
-                    }
-                }
-
-                if (actualThing == null || !seenActualThings.Add(actualThing))
+                // Stale tracked entries were pruned by PruneStaleTrackedThings; never substitute another stack of the same def,
+                // because that could be one of the pawn's own stacks.
+                if (!inventory.Contains(trackedThing) || !seenActualThings.Add(trackedThing))
                 {
                     continue;
                 }
 
-                candidates.Add(new UnloadCandidate(trackedThing, actualThing, isReplacement));
+                candidates.Add(new UnloadCandidate(trackedThing, trackedThing));
             }
 
             var tick = Find.TickManager.TicksGame;
@@ -477,11 +504,6 @@ namespace PickUpAndHaulCECarryFix
             }
 
             var selected = candidates[bestIndex];
-            if (selected.IsReplacement)
-            {
-                carriedThings.Remove(selected.TrackedThing);
-            }
-
             // Only a search that ran for this exact item this tick can be reused by the unload toil.
             state.Memo = searchedThisCall.TryGetValue(selected.ActualThing, out var memo) ? memo : null;
 
@@ -619,13 +641,11 @@ namespace PickUpAndHaulCECarryFix
         {
             public readonly Thing TrackedThing;
             public readonly Thing ActualThing;
-            public readonly bool IsReplacement;
 
-            public UnloadCandidate(Thing trackedThing, Thing actualThing, bool isReplacement)
+            public UnloadCandidate(Thing trackedThing, Thing actualThing)
             {
                 TrackedThing = trackedThing;
                 ActualThing = actualThing;
-                IsReplacement = isReplacement;
             }
         }
     }
@@ -1401,6 +1421,21 @@ namespace PickUpAndHaulCECarryFix
             {
                 new Harmony("local.pickupandhaul.cecarryfix").PatchAll();
                 Log.Message("[Pick Up And Haul CE Carry Fix] Loaded.");
+
+                // A transpiler whose target was never matched is a silent no-op; make that visible once.
+                if (TranspilerStats.PickupCountReplacements == 0
+                    || TranspilerStats.LookupCacheReplacements == 0
+                    || TranspilerStats.GatherAbortReplacements == 0)
+                {
+                    Log.Warning(
+                        "[Pick Up And Haul CE Carry Fix] A Pick Up And Haul transpiler matched nothing (pickup count="
+                        + TranspilerStats.PickupCountReplacements
+                        + ", workgiver lookup="
+                        + TranspilerStats.LookupCacheReplacements
+                        + ", gather check="
+                        + TranspilerStats.GatherAbortReplacements
+                        + "). Pick Up And Haul may have changed; the affected fix is inactive.");
+                }
             }
             catch (Exception ex)
             {
@@ -1441,8 +1476,103 @@ namespace PickUpAndHaulCECarryFix
             return Math.Max(0, Math.Min(countToPickUp, maxCount));
         }
 
+        [ThreadStatic]
+        private static Thing partialMarkerThing;
+
+        [ThreadStatic]
+        private static bool partialMarkerLeaveRemainder;
+
+        /// <summary>
+        /// Count for the take-thing toil: the planned count for this job, limited by what CE says fits. Records whether the pawn is
+        /// taking exactly a planned partial amount, so <see cref="RemainderNeedsSeparateHaul"/> can leave the remainder in place.
+        /// </summary>
         public static int CountThatFitsCurrentJob(Pawn pawn, Thing thing)
-            => CountThatFits(pawn, thing, pawn?.CurJob?.count ?? thing?.stackCount ?? 0);
+        {
+            var planned = pawn?.CurJob?.count ?? thing?.stackCount ?? 0;
+            var picked = CountThatFits(pawn, thing, planned);
+            partialMarkerThing = thing;
+            partialMarkerLeaveRemainder = thing != null
+                && PartialPickupPolicy.LeaveRemainder(planned, picked, thing.stackCount);
+            return picked;
+        }
+
+        /// <summary>
+        /// Replaces the take-thing toil's "thing.Spawned" check that ends the trip to hand-haul a leftover. A planned partial
+        /// pickup leaves its remainder where it is and keeps going; a pickup smaller than planned still hand-hauls.
+        /// </summary>
+        public static bool RemainderNeedsSeparateHaul(Thing thing)
+        {
+            var leave = partialMarkerLeaveRemainder && ReferenceEquals(partialMarkerThing, thing);
+            partialMarkerThing = null;
+            partialMarkerLeaveRemainder = false;
+            return thing != null && thing.Spawned && !leave;
+        }
+
+        /// <summary>
+        /// Replaces the take-thing toil's TryAdd(item, canMerge). Merges the new stack only into a stack that is tracked as hauled,
+        /// so the pawn's own stacks (CE ammo, medicine, meals) are never absorbed into the unload list.
+        /// </summary>
+        public static bool TryAddHauled(ThingOwner owner, Thing thing, bool canMerge)
+        {
+            if (owner == null || thing == null)
+            {
+                return false;
+            }
+
+            var pawn = (owner.Owner as Pawn_InventoryTracker)?.pawn;
+            var tracked = pawn?.GetComp<CompHauledToInventory>()?.GetHashSet();
+            if (pawn == null || tracked == null)
+            {
+                return owner.TryAdd(thing, canMerge);
+            }
+
+            if (canMerge)
+            {
+                for (var i = 0; i < owner.Count && thing.stackCount > 0; i++)
+                {
+                    var existing = owner[i];
+                    if (existing == null || existing == thing || !tracked.Contains(existing) || !existing.CanStackWith(thing))
+                    {
+                        continue;
+                    }
+
+                    existing.TryAbsorbStack(thing, true);
+                    if (thing.Destroyed || thing.stackCount <= 0)
+                    {
+                        // The caller refreshes CE's cache (CompatHelper.UpdateInventory) right after this call.
+                        return true;
+                    }
+                }
+            }
+
+            return owner.TryAdd(thing, false);
+        }
+
+        /// <summary>Next planned gather target cannot fit even one unit, so the gather toil hands the rest to a normal haul.</summary>
+        public static bool NextGatherTargetDoesNotFit(Pawn pawn)
+        {
+            var job = pawn?.CurJob;
+            var next = job?.targetA.Thing;
+            if (next == null)
+            {
+                return false;
+            }
+
+            var planned = job.count > 0 ? job.count : next.stackCount;
+            return CountThatFits(pawn, next, planned) <= 0;
+        }
+
+        /// <summary>
+        /// The encumbrance the gather toil compares to 0.9: the real ratio only when the pawn is over capacity, otherwise 0.
+        /// The planner fills capacity to 100%, so the trip must not end at the 80%/90% start thresholds.
+        /// </summary>
+        public static float GatherAbortRatio(Pawn pawn)
+        {
+            var ratio = EncumbrancePercent(pawn);
+            return ratio > 1f + OverCapacityTolerance ? ratio : 0f;
+        }
+
+        private const float OverCapacityTolerance = 0.0001f;
 
         public static int LastPlannedCount(Job job, Thing thing)
         {
@@ -1791,6 +1921,9 @@ namespace PickUpAndHaulCECarryFix
 
         public static bool Prefix(Pawn pawn, HashSet<Thing> carriedThings, ref ThingCount __result)
         {
+            // Always prune first (also when routing is disabled) so Pick Up And Haul's own straggler substitution never sees a stale entry.
+            PickUpAndHaulUnloadRouting.PruneStaleTrackedThings(pawn, carriedThings);
+
             if (!PickUpAndHaulUnloadRouting.Enabled)
             {
                 return true;
@@ -2085,6 +2218,7 @@ namespace PickUpAndHaulCECarryFix
             {
                 if (IsWorkGiverDefFirstCall(instruction))
                 {
+                    TranspilerStats.LookupCacheReplacements++;
                     yield return new CodeInstruction(OpCodes.Call, replacement);
                 }
                 else
@@ -2128,22 +2262,65 @@ namespace PickUpAndHaulCECarryFix
                 typeof(CeInventoryUtility),
                 nameof(CeInventoryUtility.CountThatFitsCurrentJob),
                 new[] { typeof(Pawn), typeof(Thing) });
+            var thingOwnerTryAdd = AccessTools.Method(typeof(ThingOwner), nameof(ThingOwner.TryAdd), new[] { typeof(Thing), typeof(bool) });
+            var tryAddHauled = AccessTools.Method(typeof(CeInventoryUtility), nameof(CeInventoryUtility.TryAddHauled));
+            var thingSpawnedGetter = AccessTools.PropertyGetter(typeof(Thing), nameof(Thing.Spawned));
+            var remainderNeedsSeparateHaul = AccessTools.Method(typeof(CeInventoryUtility), nameof(CeInventoryUtility.RemainderNeedsSeparateHaul));
 
+            // Only the method that contains the CanFitInInventory call (the take-thing toil) gets the follow-up replacements.
+            var inTakeThingToil = false;
+            var replacedSpawned = false;
             foreach (var instruction in instructions)
             {
                 if (canFitInInventory != null && replacement != null && instruction.Calls(canFitInInventory))
                 {
+                    inTakeThingToil = true;
+                    TranspilerStats.PickupCountReplacements++;
                     var replacementInstruction = new CodeInstruction(instruction)
                     {
                         operand = replacement
                     };
                     yield return replacementInstruction;
                 }
+                else if (inTakeThingToil && tryAddHauled != null && thingOwnerTryAdd != null && instruction.Calls(thingOwnerTryAdd))
+                {
+                    // Merge hauled stacks only into stacks tracked as hauled, never into the pawn's own stacks.
+                    TranspilerStats.PickupCountReplacements++;
+                    yield return TranspilerStats.CallInstead(instruction, tryAddHauled);
+                }
+                else if (inTakeThingToil && !replacedSpawned && remainderNeedsSeparateHaul != null && thingSpawnedGetter != null && instruction.Calls(thingSpawnedGetter))
+                {
+                    // Leave a planned storage-limited remainder where it is instead of ending the trip to hand-haul it.
+                    replacedSpawned = true;
+                    TranspilerStats.PickupCountReplacements++;
+                    yield return TranspilerStats.CallInstead(instruction, remainderNeedsSeparateHaul);
+                }
                 else
                 {
                     yield return instruction;
                 }
             }
+        }
+    }
+
+    /// <summary>
+    /// Counts how many call sites each transpiler rewrote so a silent no-op (a target that was never matched, or IL that no longer
+    /// has the expected call) is reported once at startup.
+    /// </summary>
+    internal static class TranspilerStats
+    {
+        public static int PickupCountReplacements;
+        public static int LookupCacheReplacements;
+        public static int GatherAbortReplacements;
+
+        /// <summary>Replaces a call but keeps the original instruction's labels and exception blocks.</summary>
+        public static CodeInstruction CallInstead(CodeInstruction original, MethodInfo method)
+        {
+            return new CodeInstruction(original)
+            {
+                opcode = OpCodes.Call,
+                operand = method
+            };
         }
     }
 
@@ -2167,13 +2344,24 @@ namespace PickUpAndHaulCECarryFix
         public static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
         {
             var encumbrancePercent = AccessTools.Method(typeof(MassUtility), nameof(MassUtility.EncumbrancePercent), new[] { typeof(Pawn) });
-            var ceEncumbrancePercent = AccessTools.Method(typeof(CeInventoryUtility), nameof(CeInventoryUtility.EncumbrancePercent));
+            var gatherAbortRatio = AccessTools.Method(typeof(CeInventoryUtility), nameof(CeInventoryUtility.GatherAbortRatio));
+            var compatHelper = AccessTools.TypeByName("PickUpAndHaul.CompatHelper");
+            var ceOverweight = compatHelper == null ? null : AccessTools.Method(compatHelper, "CeOverweight");
+            var nextGatherTargetDoesNotFit = AccessTools.Method(typeof(CeInventoryUtility), nameof(CeInventoryUtility.NextGatherTargetDoesNotFit));
 
+            // The planner fills CE capacity to 100%, so the gather toil must not abort at the 80% trip-start threshold.
+            // It aborts only when the pawn is over capacity or the next planned item cannot fit at all.
             foreach (var instruction in instructions)
             {
                 if (instruction.Calls(encumbrancePercent))
                 {
-                    yield return new CodeInstruction(OpCodes.Call, ceEncumbrancePercent);
+                    TranspilerStats.GatherAbortReplacements++;
+                    yield return TranspilerStats.CallInstead(instruction, gatherAbortRatio);
+                }
+                else if (ceOverweight != null && instruction.Calls(ceOverweight))
+                {
+                    TranspilerStats.GatherAbortReplacements++;
+                    yield return TranspilerStats.CallInstead(instruction, nextGatherTargetDoesNotFit);
                 }
                 else
                 {

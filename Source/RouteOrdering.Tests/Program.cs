@@ -27,6 +27,7 @@ internal static class Program
 
 #if HAS_HARMONY_TARGET_DISCOVERY
         Run("Harmony target discovery excludes inherited methods", HarmonyTargetDiscoveryExcludesInheritedMethods);
+        Run("Harmony target discovery finds closure and this-capturing lambdas of a compiled iterator", HarmonyTargetDiscoveryCoversCompiledLambdaCallSites);
 #else
         Fail("Harmony target-discovery production helper is missing");
 #endif
@@ -54,8 +55,16 @@ internal static class Program
 #if HAS_CAPACITY_MATH
         Run("count by dimension handles zero, negative and epsilon cases", CountByDimensionEdgeCases);
         Run("added ratio ignores dimensions without capacity", AddedRatioIgnoresZeroCapacity);
+        Run("exact capacity fill counts as full", ExactFillCountsAsFull);
 #else
         Fail("capacity-math production helper is missing");
+#endif
+
+#if HAS_PARTIAL_PICKUP_POLICY
+        Run("planned partial pickup leaves the remainder", PlannedPartialPickupLeavesRemainder);
+        Run("under-pick, zero and full-stack pickups do not leave a remainder", UnderPickZeroAndFullStackDoNotLeaveRemainder);
+#else
+        Fail("partial-pickup policy production helper is missing");
 #endif
 
 #if HAS_UNLOAD_DESTINATION_CACHE
@@ -218,8 +227,87 @@ internal static class Program
         AssertFalse(methodNames.Contains(nameof(object.GetType)));
         AssertFalse(methodNames.Contains(nameof(object.Equals)));
     }
+
+    private static void HarmonyTargetDiscoveryCoversCompiledLambdaCallSites()
+    {
+        var methods = new List<MethodBase>(
+            HarmonyTargetDiscovery.GetDeclaredMethods(typeof(CompiledIteratorFixture), "MakeNewToils"));
+
+        var distinct = new HashSet<MethodBase>(methods);
+        AssertEqual(methods.Count, distinct.Count);
+
+        var markerToken = typeof(CompiledIteratorFixture)
+            .GetMethod(nameof(CompiledIteratorFixture.Marker), BindingFlags.Public | BindingFlags.Static)
+            .MetadataToken;
+
+        var callerDeclaringTypes = new List<Type>();
+        foreach (var method in methods)
+        {
+            if (CallsMethodToken(method, markerToken))
+            {
+                callerDeclaringTypes.Add(method.DeclaringType);
+            }
+        }
+
+        // One lambda captures a local (compiled into a closure display class) and one captures only this (compiled onto the
+        // containing type); neither lives in a nested type whose name contains MakeNewToils.
+        var foundInDisplayClass = false;
+        var foundOnContainingType = false;
+        foreach (var type in callerDeclaringTypes)
+        {
+            if (type == typeof(CompiledIteratorFixture))
+            {
+                foundOnContainingType = true;
+            }
+            else if (type.Name.IndexOf("DisplayClass", StringComparison.Ordinal) >= 0)
+            {
+                foundInDisplayClass = true;
+            }
+        }
+
+        AssertTrue(foundInDisplayClass);
+        AssertTrue(foundOnContainingType);
+    }
+
+    private static bool CallsMethodToken(MethodBase method, int metadataToken)
+    {
+        var il = method.GetMethodBody()?.GetILAsByteArray();
+        if (il == null)
+        {
+            return false;
+        }
+
+        for (var i = 0; i + 4 < il.Length; i++)
+        {
+            if (il[i] == 0x28 && BitConverter.ToInt32(il, i + 1) == metadataToken)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 #endif
 
+
+#if HAS_PARTIAL_PICKUP_POLICY
+    private static void PlannedPartialPickupLeavesRemainder()
+    {
+        // Planned 20 of a 75 stack and the pawn took exactly 20: leave 55 and continue.
+        AssertTrue(PartialPickupPolicy.LeaveRemainder(20, 20, 75));
+    }
+
+    private static void UnderPickZeroAndFullStackDoNotLeaveRemainder()
+    {
+        // Pawn took less than planned: end the trip and hand-haul the rest.
+        AssertFalse(PartialPickupPolicy.LeaveRemainder(20, 12, 75));
+        // Nothing taken.
+        AssertFalse(PartialPickupPolicy.LeaveRemainder(20, 0, 75));
+        AssertFalse(PartialPickupPolicy.LeaveRemainder(0, 0, 75));
+        // The whole stack was planned and taken: no remainder exists.
+        AssertFalse(PartialPickupPolicy.LeaveRemainder(75, 75, 75));
+    }
+#endif
 
 #if HAS_ADAPTIVE_STORAGE_RESERVATION_POLICY
     private static void AdaptiveStorageUsesJustInTimeReservations()
@@ -477,6 +565,21 @@ internal static class Program
         AssertEqual(0f, CapacityMath.AddedRatio(5, 2f, -3f));
         AssertEqual(0.5f, CapacityMath.AddedRatio(5, 1f, 10f));
     }
+
+    private static void ExactFillCountsAsFull()
+    {
+        var ratio = 0.7f;
+        for (var i = 0; i < 3; i++)
+        {
+            ratio += CapacityMath.AddedRatio(1, 0.1f, 1f);
+        }
+
+        AssertTrue(CapacityMath.IsFull(ratio));
+        AssertTrue(CapacityMath.IsFull(1f));
+        AssertTrue(CapacityMath.IsFull(1.3f));
+        AssertFalse(CapacityMath.IsFull(0.9f));
+        AssertFalse(CapacityMath.IsFull(0.9998f));
+    }
 #endif
 
 #if HAS_UNLOAD_DESTINATION_CACHE
@@ -675,6 +778,31 @@ internal static class Program
         if (!EqualityComparer<T>.Default.Equals(expected, actual))
         {
             throw new InvalidOperationException($"Expected {expected}, received {actual}.");
+        }
+    }
+#endif
+
+#if HAS_HARMONY_TARGET_DISCOVERY
+    /// <summary>Real compiler output shaped like PUAH's MakeNewToils: an iterator whose lambdas capture a local and only this.</summary>
+    internal sealed class CompiledIteratorFixture
+    {
+        private int field = 3;
+
+        public static void Marker(int value)
+        {
+            GC.KeepAlive(value);
+        }
+
+        public IEnumerable<Action> MakeNewToils()
+        {
+            var local = field + 1;
+            yield return () => Marker(local);
+        }
+
+        // Compiled onto this type as an instance lambda (it captures only this), not into a closure display class.
+        public Action MakeNewToils(int unused)
+        {
+            return () => Marker(field);
         }
     }
 #endif

@@ -203,7 +203,7 @@ Project: `Source\RouteOrdering.Tests` (net8 console).
    - Diagnostics on. Compare the Phase 2 baseline with the post-fix aggregates for:
      - (a) Adaptive shelves full and hundreds of loose items (F1, F7): `HasJobOnThing` ms and adaptive cells examined should drop by orders of magnitude.
      - (b) A dense pile after mining or a raid (F2): validator calls ≤ cap; pawns still pick nearby items.
-     - (c) A pawn unloading 15+ stacks to Adaptive Storage, including a reserved-shelf wait (F3): searches per unload roughly equal to the number of distinct defs; no livelock; still waits correctly.
+     - (c) A pawn unloading 15+ stacks to Adaptive Storage, including a reserved-shelf wait (F3) [BLOCKED by Run 6 fix 2: the planned-target hold never fired because the planned cell was read from targetB; re-test after Run 6]: searches per unload roughly equal to the number of distinct defs; no livelock; still waits correctly.
      - (d) Many stockpiles with mixed priorities and item types (F4): same destinations as before, fewer lookups.
      - (e) Urgent-haul designation (Allow Tool / Keyz) still restricts extra pickups.
    - Toggle each setting off and confirm the fallback behavior.
